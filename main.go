@@ -529,6 +529,10 @@ func runAPI(ctx *config.Context) {
 		cardActionRuntime.Stop()
 		panic(err)
 	}
+	if err := permissionbundle.VerifyAfterSetup(ctx); err != nil {
+		cardActionRuntime.Stop()
+		panic(fmt.Errorf("verify permission bundle runtime after module setup: %w", err))
+	}
 	// The system-setting singleton may have been constructed before module
 	// migrations completed. Reload it now, then probe the effective SMTP only
 	// when management-console MFA is enabled. A failed probe is an operational

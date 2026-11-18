@@ -694,7 +694,7 @@ func TestInstallOptInAndEnvWiringFailsClosedWithoutAuthorityAndServesWhenValid(t
 }
 
 func TestContractManifestV4AndV5ByteAndHashIntegrity(t *testing.T) {
-	for _, manifestName := range []string{"contract-manifest-v4.json", "contract-manifest-v5.json", "contract-manifest-v6.json", "contract-manifest-v7.json", "contract-manifest-v8.json", "contract-manifest-v9.json"} {
+	for _, manifestName := range []string{"contract-manifest-v4.json", "contract-manifest-v5.json", "contract-manifest-v6.json", "contract-manifest-v7.json", "contract-manifest-v8.json", "contract-manifest-v9.json", "contract-manifest-v10.json"} {
 		t.Run(manifestName, func(t *testing.T) {
 			raw, err := os.ReadFile(filepath.Join("contracts", manifestName))
 			require.NoError(t, err)
@@ -715,4 +715,283 @@ func TestContractManifestV4AndV5ByteAndHashIntegrity(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestNativeSingleWriterLineageAuthorityStartupRestartAndFailClosedBoundaries(t *testing.T) {
+	ctx := t.Context()
+	dbFile := filepath.Join(t.TempDir(), "native-lineage.sqlite")
+	f := newServerFacts(t)
+	_ = dbFile
+
+	candInput, _ := cliCandidatePackageV5(t)
+	catDir := filepath.Join(t.TempDir(), "catalog-v2")
+	for rel, data := range candInput.Files {
+		full := filepath.Join(catDir, filepath.FromSlash(rel))
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o700))
+		require.NoError(t, os.WriteFile(full, data, 0o600))
+	}
+	witnessPath := filepath.Join(t.TempDir(), "source-slot-witness-v5.json.gz")
+	witnessRaw, err := os.ReadFile("testdata/source-slot-witness-v5.json.gz")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(witnessPath, witnessRaw, 0o600))
+	const witnessSHA256 = "0c5da173bd0f53c64562a70a5c5feebc955ad111bbe84ed11f5588c08b4b9c0b"
+
+	statePath := filepath.Join(t.TempDir(), "authority-state.json")
+	incarnation := strings.Repeat("5", 32)
+	keyBytes := []byte(strings.Repeat("k", 32))
+
+	baseCfg := InstallConfig{
+		Enabled:                   true,
+		Session:                   f.s.Session,
+		Origin:                    fixtureKey.Origin,
+		Pin:                       candInput.Pin,
+		CatalogDir:                catDir,
+		SlotWitnessPath:           witnessPath,
+		SlotWitnessSHA256:         witnessSHA256,
+		AuthorityMode:             AuthorityModeNativeSingleWriterV1,
+		AuthorityID:               "sql-native-writer",
+		AuthorityIncarnation:      incarnation,
+		AuthorityStatePath:        statePath,
+		AuthorityKey:              keyBytes,
+		FactProviderMode:          NativeFactProviderModeServerStoreV1,
+		ServerMessageHooks:        testServerHooks(),
+		ServerStoreAuthorityID:    "octo-server-message-store",
+		ServerStoreIncarnation:    incarnation,
+		ServerPermitKey:           keyBytes,
+		ServerDurablePermitLedger: true,
+		testNoLocks:               true,
+	}
+
+	// 0. Existing bot_permission_scope row (from newServerFacts) when AuthorityStatePath is missing
+	// fails closed even when AuthorityProvision=true (refuses to bootstrap over existing scopes or mismatched incarnation).
+	cPreExisting := &config.Context{}
+	cfgPreExisting := baseCfg
+	cfgPreExisting.AuthorityProvision = true
+	require.ErrorIs(t, InstallOptIn(cPreExisting, cfgPreExisting), ErrUnavailable)
+	require.Nil(t, RuntimeFor(cPreExisting))
+
+	// Clear the pre-seeded scope row and add bot_token column so BeginAssociation/CommitAssociations can provision cleanly.
+	_, err = f.s.Session.Exec(`DELETE FROM bot_permission_scope`)
+	require.NoError(t, err)
+	_, err = f.s.Session.Exec(`ALTER TABLE robot ADD COLUMN bot_token TEXT DEFAULT 'bf_synthetic'`)
+	require.NoError(t, err)
+
+	// 1. Unprovisioned state with AuthorityProvision=false fails closed.
+	cUnprov := &config.Context{}
+	cfgUnprov := baseCfg
+	cfgUnprov.AuthorityProvision = false
+	require.ErrorIs(t, InstallOptIn(cUnprov, cfgUnprov), ErrUnavailable)
+	require.Nil(t, RuntimeFor(cUnprov))
+
+	// 2. Missing incarnation, short key, or missing state path fails closed even with AuthorityProvision=true.
+	for _, mutate := range []func(*InstallConfig){
+		func(ic *InstallConfig) { ic.AuthorityIncarnation = ""; ic.ServerStoreIncarnation = "" },
+		func(ic *InstallConfig) { ic.AuthorityKey = []byte("short"); ic.ServerPermitKey = []byte("short") },
+		func(ic *InstallConfig) { ic.AuthorityStatePath = "" },
+	} {
+		cBad := &config.Context{}
+		cfgBad := baseCfg
+		cfgBad.AuthorityProvision = true
+		mutate(&cfgBad)
+		require.ErrorIs(t, InstallOptIn(cBad, cfgBad), ErrUnavailable)
+		require.Nil(t, RuntimeFor(cBad))
+	}
+
+	// 3. Initial bootstrap with AuthorityProvision=true succeeds and creates SQL + 0600 host state.
+	c1 := &config.Context{}
+	cfg1 := baseCfg
+	cfg1.AuthorityProvision = true
+	require.NoError(t, InstallOptIn(c1, cfg1))
+	require.NoError(t, VerifyAfterSetup(c1))
+	rt1 := RuntimeFor(c1)
+	require.NotNil(t, rt1)
+	require.True(t, rt1.HasFacts())
+	require.True(t, rt1.HasDeliveryBinding())
+
+	stInfo, err := os.Lstat(statePath)
+	require.NoError(t, err)
+	require.True(t, stInfo.Mode().IsRegular())
+	require.Zero(t, stInfo.Mode().Perm()&0o077)
+
+	// 4. Before scope provisioning, native facts and self-read fail closed (never auto-provision on read/recovery).
+	_, err = rt1.Store().Self(ctx, fixtureKey)
+	require.ErrorIs(t, err, ErrUnavailable)
+	probeReq := map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("1", 32),
+		"operation":       "resolve",
+		"purpose":         "admit",
+		"references":      []any{map[string]any{"delivery_reference": "s1-1-00-1-0"}},
+	}
+	_, err = rt1.Facts(ctx, fixtureKey, bytes.NewReader(canonical(probeReq)))
+	require.ErrorIs(t, err, ErrUnavailable)
+
+	// 5. Provision bot scope via BeginAssociation + CommitAssociations.
+	txAssoc, cancelAssoc, err := BeginAssociation(c1, f.s.Session)
+	require.NoError(t, err)
+	defer cancelAssoc()
+	require.NoError(t, CommitAssociations(c1, txAssoc, Association{BotUID: fixtureKey.BotUID, SpaceID: fixtureKey.SpaceID, New: true}))
+
+	// 6. Seed a space-tagged DM message and exercise Self, BindDeliveredMessage, Resolve, and HistoryDisclosure under Process 1.
+	dmPayload := map[string]any{"type": 1, "space_id": "space", "content": "NATIVE-STARTUP-SECRET"}
+	dmDigest := sha256OfJSON(dmPayload)
+	f.msg("8801", 1, "peer", f.dmChan, 1, dmPayload)
+
+	bundle1, err := rt1.Store().Self(ctx, fixtureKey)
+	require.NoError(t, err)
+	require.Equal(t, "0", bundle1.Revision)
+	require.Equal(t, "0", bundle1.ContextEpoch)
+	require.Equal(t, candInput.Pin.Digest, bundle1.CatalogDigest)
+
+	bindOut1, err := rt1.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "req-native-bind-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              f.dmChan,
+		"message_id":              "8801",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": dmDigest,
+	})))
+	require.NoError(t, err)
+	bindObj1 := fixtureObject(t, bindOut1)["binding"].(map[string]any)
+	require.Equal(t, "bound", bindObj1["status"])
+	delivRef := bindObj1["delivery_reference"].(string)
+	hdrRef := bindObj1["header_reference"].(string)
+
+	discOut1, err := rt1.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("2", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("c", 32),
+		"context_epoch":   "0",
+		"headers":         []any{map[string]any{"header_reference": hdrRef}},
+	})))
+	require.NoError(t, err)
+	discRes1 := fixtureObject(t, discOut1)["results"].([]any)[0].(map[string]any)
+	require.Equal(t, "resolved", discRes1["status"])
+	permit1 := discRes1["permit"].(string)
+	rt1Provider := rt1.facts.(*SQLNativeFactAdapter).IMProvider.(*ServerMessageFactProvider)
+	require.NoError(t, rt1Provider.ConsumeDisclosurePermitContext(ctx, fixtureKey, strings.Repeat("c", 32), "0", hdrRef, dmDigest, permit1))
+
+	// 7. Normal process restart (AuthorityProvision=false) on the same SQL store and AuthorityStatePath:
+	// bumps election_generation (1 -> 2), fences Process 1, preserves incarnation, and serves under Process 2.
+	c2 := &config.Context{}
+	cfg2 := baseCfg
+	cfg2.AuthorityProvision = false
+	require.NoError(t, InstallOptIn(c2, cfg2))
+	require.NoError(t, VerifyAfterSetup(c2))
+	rt2 := RuntimeFor(c2)
+	require.NotNil(t, rt2)
+
+	// Stale writer (Process 1) is now fenced out and fails closed on both policy and fact reads.
+	_, err = rt1.Store().Self(ctx, fixtureKey)
+	require.ErrorIs(t, err, ErrUnavailable, "superseded writer process must fail closed")
+	_, err = rt1.Facts(ctx, fixtureKey, bytes.NewReader(canonical(probeReq)))
+	require.ErrorIs(t, err, ErrUnavailable, "superseded writer process must fail closed on facts")
+
+	// Restarted writer (Process 2) serves Self and Facts with the same 32-hex incarnation and higher position.
+	bundle2, err := rt2.Store().Self(ctx, fixtureKey)
+	require.NoError(t, err)
+	require.Equal(t, bundle1.Incarnation, bundle2.Incarnation)
+	require.Equal(t, bundle1.Digest, bundle2.Digest)
+
+	resOut2, err := rt2.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("3", 32),
+		"operation":       "resolve",
+		"purpose":         "admit",
+		"references":      []any{map[string]any{"delivery_reference": delivRef}},
+	})))
+	require.NoError(t, err)
+	resEnv2 := fixtureObject(t, resOut2)
+	auths2 := resEnv2["authorities"].([]any)
+	require.Len(t, auths2, 2)
+	for _, rawAuth := range auths2 {
+		a := rawAuth.(map[string]any)
+		require.Equal(t, incarnation, a["incarnation"])
+		require.Equal(t, "ack_before_read_start", a["consistency"])
+	}
+
+	// Consumed permit from Process 1 remains unavailable across Process 2 restart.
+	discOut2, err := rt2.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("4", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("c", 32),
+		"context_epoch":   "0",
+		"headers":         []any{map[string]any{"header_reference": hdrRef}},
+	})))
+	require.NoError(t, err)
+	discRes2 := fixtureObject(t, discOut2)["results"].([]any)[0].(map[string]any)
+	require.Equal(t, "unavailable", discRes2["status"])
+	require.Equal(t, "disclosure_unavailable", discRes2["reason"])
+
+	// 8. Negative restart checks: wrong incarnation, wrong key, regressed SQL position, or lost state file fail closed.
+	cWrongInc := &config.Context{}
+	cfgWrongInc := baseCfg
+	cfgWrongInc.AuthorityIncarnation = strings.Repeat("9", 32)
+	cfgWrongInc.ServerStoreIncarnation = strings.Repeat("9", 32)
+	require.ErrorIs(t, InstallOptIn(cWrongInc, cfgWrongInc), ErrUnavailable)
+
+	cWrongKey := &config.Context{}
+	cfgWrongKey := baseCfg
+	cfgWrongKey.AuthorityKey = []byte(strings.Repeat("z", 32))
+	require.ErrorIs(t, InstallOptIn(cWrongKey, cfgWrongKey), ErrUnavailable)
+
+	// Simulate SQL rollback / stale restore behind host state checkpoint.
+	var savedAck, savedCommit, savedCheck int64
+	var savedWriterID, savedHMAC string
+	require.NoError(t, f.s.Session.QueryRow(`SELECT active_writer_id,committed_position,acknowledged_position,recoverable_scope_checkpoint,state_hmac FROM `+NativeAuthorityLineageTable+` WHERE singleton=1`).Scan(&savedWriterID, &savedCommit, &savedAck, &savedCheck, &savedHMAC))
+
+	regressedDriver, err := NewNativeSingleWriterLineageDriver(NativeSingleWriterLineageConfig{
+		Session:       f.s.Session,
+		Origin:        fixtureKey.Origin,
+		AuthorityID:   "sql-native-writer",
+		Incarnation:   incarnation,
+		CatalogDigest: candInput.Pin.Digest,
+		StatePath:     statePath,
+		Key:           keyBytes,
+		testNoLocks:   true,
+	})
+	require.NoError(t, err)
+	regressedRow := nativeAuthoritySQLRow{
+		AuthorityID:                "sql-native-writer",
+		Incarnation:                incarnation,
+		CatalogDigest:              candInput.Pin.Digest,
+		ElectionGeneration:         1,
+		ActiveWriterID:             strings.Repeat("a", 32),
+		CommittedPosition:          1,
+		AcknowledgedPosition:       1,
+		RecoverableScopeCheckpoint: 1,
+	}
+	regressedRow.StateHMAC = regressedDriver.sqlStateMAC(regressedRow)
+	_, err = f.s.Session.Exec(`UPDATE `+NativeAuthorityLineageTable+` SET election_generation=1,active_writer_id=?,committed_position=1,acknowledged_position=1,recoverable_scope_checkpoint=1,state_hmac=? WHERE singleton=1`, regressedRow.ActiveWriterID, regressedRow.StateHMAC)
+	require.NoError(t, err)
+
+	cRegressed := &config.Context{}
+	require.ErrorIs(t, InstallOptIn(cRegressed, baseCfg), ErrUnavailable, "SQL rollback behind host state checkpoint must fail closed")
+
+	// Restore SQL row, then simulate host journal loss (missing statePath) while SQL lineage exists.
+	_, err = f.s.Session.Exec(`UPDATE `+NativeAuthorityLineageTable+` SET election_generation=2,active_writer_id=?,committed_position=?,acknowledged_position=?,recoverable_scope_checkpoint=?,state_hmac=? WHERE singleton=1`, savedWriterID, savedCommit, savedAck, savedCheck, savedHMAC)
+	require.NoError(t, err)
+	savedHostBytes, err := os.ReadFile(statePath)
+	require.NoError(t, err)
+	require.NoError(t, os.Remove(statePath))
+
+	cJournalLost := &config.Context{}
+	cfgJournalLost := baseCfg
+	cfgJournalLost.AuthorityProvision = true
+	require.ErrorIs(t, InstallOptIn(cJournalLost, cfgJournalLost), ErrUnavailable, "missing host state file against existing SQL lineage must fail closed even when Provision=true")
+
+	// Restore host state file and verify clean restart succeeds again.
+	require.NoError(t, os.WriteFile(statePath, savedHostBytes, 0o600))
+	c3 := &config.Context{}
+	require.NoError(t, InstallOptIn(c3, baseCfg))
+	require.NotNil(t, RuntimeFor(c3))
 }

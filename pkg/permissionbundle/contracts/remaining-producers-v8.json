@@ -1,0 +1,49 @@
+{
+  "contract": "permission-server-remaining-producers-v8",
+  "task": "XIN-2793",
+  "charter_baseline": "v52-r3-xin2858-native-startup-repair",
+  "supersedes": "remaining-producers-v7.json for active ownership; v1-v7 retained byte-for-byte",
+  "resolved_in_this_slice": [
+    {
+      "id": "XIN-2858-server-native-startup-authority-binding",
+      "was": "main.go:617-618 called InstallFromEnvWithHooks(ctx, nil, nil, ...) and pkg/permissionbundle/install.go:158-167 rejected nil AuthorityDriver when OCTO_PERMISSION_BUNDLE_ENABLED=true, blocking isolated native startup in XIN-2858",
+      "status": "DELIVERED_IN_SERVER: AuthorityModeNativeSingleWriterV1 (native_single_writer_lineage_v1) wired in InstallFromEnvWithHooks/InstallOptIn and main.go (+ VerifyAfterSetup after module.Setup), backed by NativeSingleWriterLineageDriver (SQL bot_permission_authority_lineage + 0600 fsynced HMAC-authenticated AuthorityStatePath + bot_permission_scope anchor/digest verification) and auto-provisioning ServerDisclosurePermitDDL on bootstrap when DurablePermitLedger=true"
+    },
+    {
+      "id": "XIN-2858-server-facts-provisioned-scope-guard",
+      "was": "Runtime.Facts (resolve) and Runtime.BindDeliveredMessage verified Native.Scope without requiring Store.read(SHARE) on bot_permission_scope",
+      "status": "DELIVERED_IN_SERVER: Under native_single_writer_lineage_v1, Runtime.Facts and Runtime.BindDeliveredMessage enforce Store.verifyProvisionedScope (Store.read(SHARE) + loadRelease + catalogMembers) inside the RepeatableRead transaction so missing/retired/corrupt/wrong-incarnation scopes fail closed on all Bot fact and recovery calls"
+    }
+  ],
+  "previously_resolved_in_server": [
+    "S-B1-message-ttl-expire (Verified CLOSED in XIN-2834 Round 2 & Round 3 reviews)",
+    "S-B2-history-headers-space-and-source-guard (Verified CLOSED in XIN-2834 Round 3 review)",
+    "S-B3-history-disclosure-scope-and-epoch-guard (Verified CLOSED in XIN-2834 Round 3 review)",
+    "R2-server-seam (POST /v1/bot/permission-facts/v1/bind-delivery metadata-only delivery binding)",
+    "R3-startup-composition (main.go:installPermissionBundle -> InstallFromEnvWithHooks with message.NewServerMessageFactHooks)",
+    "own-session-consistency (RepeatableRead *dbr.Tx propagated across SQLNativeFactAdapter and ServerMessageFactProvider with FOR SHARE NOWAIT)",
+    "permit-durability-seam (DurablePermitLedger backed by bot_permission_disclosure_permit)"
+  ],
+  "remaining": [
+    {
+      "id": "XIN-2794-cli-isolated-catalog-bootstrap",
+      "owner": "XIN-2794 (octo-cli)",
+      "item": "Bounded explicit isolated-test catalog bootstrap path in internal/mcp/permission_bootstrap.go matching Server/Agent and approved v42 verifier/grammar without changing production support list"
+    },
+    {
+      "id": "XIN-2795-agent-native-recovery-binding",
+      "owner": "XIN-2795 (codex-channel-octo)",
+      "item": "Replace synthetic-only recover dependency in src/permissions/endpoint-factory.ts with authenticated native recovery binding over checked Server endpoints (GET /v1/bot/permission-bundle/v1 and POST /v1/bot/permission-facts/v1)"
+    },
+    {
+      "id": "XIN-2834-exact-head-rereview",
+      "owner": "XIN-2834 (independent reviewer)",
+      "item": "Independent exact-head re-review of the new 3-head repair tuple before retrying XIN-2858 isolated deployment"
+    }
+  ],
+  "residual_limitations": [
+    "NativeSingleWriterLineageDriver enforces single-writer continuity across normal process restart via cross-checked SQL bot_permission_authority_lineage + 0600 host AuthorityStatePath + bot_permission_scope anchor verification; it does not claim multi-writer HA failover or stale-restore serving",
+    "Simultaneous rollback of both the SQL database and the host AuthorityStatePath to an identical prior point-in-time is outside single-host detection and remains unsupported without an external authority",
+    "Group/thread original visibility (without a visibles exclusion) and untagged DM space remain explicit unknown/non-serving for admit/contributor"
+  ]
+}

@@ -334,6 +334,11 @@ func (r *Runtime) Facts(ctx context.Context, key Key, body io.Reader) ([]byte, e
 		return nil, e
 	}
 	defer t.tx.RollbackUnlessCommitted()
+	if r.store.requireProvisionedScopeOnFacts {
+		if e := r.store.verifyProvisionedScope(ctx, t); e != nil {
+			return nil, e
+		}
+	}
 	req, input, e := nativeRequest(body)
 	if e != nil {
 		return nil, e
@@ -597,6 +602,11 @@ func (r *Runtime) BindDeliveredMessage(ctx context.Context, key Key, body io.Rea
 		return nil, e
 	}
 	defer t.tx.RollbackUnlessCommitted()
+	if r.store.requireProvisionedScopeOnFacts {
+		if e := r.store.verifyProvisionedScope(ctx, t); e != nil {
+			return nil, e
+		}
+	}
 	req, input, e := parseDeliveryBindingRequest(body)
 	if e != nil {
 		return nil, e

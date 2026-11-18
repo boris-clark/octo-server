@@ -60,7 +60,8 @@ type Store struct {
 	Releases  Releases
 	// Empty only in in-package disposable SQLite tests. Production always uses
 	// the current InnoDB locking suffix; this is not a second runtime store.
-	testNoLocks bool
+	testNoLocks                    bool
+	requireProvisionedScopeOnFacts bool
 }
 type Attribution struct {
 	UpdatedBy *string `json:"updated_by"`
@@ -203,6 +204,18 @@ func (s Store) Get(ctx context.Context, key Key, actor string) (OwnerResponse, e
 func (s Store) Self(ctx context.Context, key Key) (Bundle, error) {
 	p, e := s.Get(ctx, key, "")
 	return p.Bundle, e
+}
+
+func (s Store) verifyProvisionedScope(ctx context.Context, t *scopeTx) error {
+	h, e := s.read(ctx, t, "SHARE")
+	if e != nil {
+		return e
+	}
+	release, e := loadRelease(ctx, s.Releases, h.p.Pin())
+	if e != nil || !catalogMembers(h.p, release) {
+		return ErrUnavailable
+	}
+	return nil
 }
 
 // Mutate parses after current scope authorization, resolves references before
