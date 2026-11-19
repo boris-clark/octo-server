@@ -124,6 +124,79 @@ func nativeLexical(v any) bool {
 	}
 	return true
 }
+func validateEvaluateCurrentAccessRequest(m map[string]any) bool {
+	allowed := map[string]bool{
+		"schema_version":          true,
+		"profile_version":         true,
+		"request_id":              true,
+		"operation":               true,
+		"purpose":                 true,
+		"channel_type":            true,
+		"channel_id":              true,
+		"caller_uid":              true,
+		"message_id":              true,
+		"message_seq":             true,
+		"observed_payload_sha256": true,
+	}
+	for k := range m {
+		if !allowed[k] {
+			return false
+		}
+	}
+	if m["schema_version"] != json.Number("1") || m["profile_version"] != json.Number("1") || m["operation"] != "evaluate_current_access" {
+		return false
+	}
+	reqID, ok := m["request_id"].(string)
+	if !ok || (!ValidNativeID(reqID) && !validHex(reqID, 32)) {
+		return false
+	}
+	purpose, ok := m["purpose"].(string)
+	if !ok || (purpose != "admit" && purpose != "reply") {
+		return false
+	}
+	chTypeNum, ok := m["channel_type"].(json.Number)
+	if !ok {
+		return false
+	}
+	chTypeU64, err := U64(string(chTypeNum))
+	if err != nil || (chTypeU64 != channelTypePerson && chTypeU64 != channelTypeGroup && chTypeU64 != channelTypeThread) {
+		return false
+	}
+	chID, ok := m["channel_id"].(string)
+	if !ok || chID == "" || len(chID) > 256 {
+		return false
+	}
+	callerUID, ok := m["caller_uid"].(string)
+	if !ok || !ValidNativeID(callerUID) {
+		return false
+	}
+	if rawMsgID, exists := m["message_id"]; exists && rawMsgID != nil {
+		msgID, ok := rawMsgID.(string)
+		if !ok {
+			return false
+		}
+		if n, err := U64(msgID); err != nil || n == 0 || n > 9223372036854775807 {
+			return false
+		}
+	}
+	if rawMsgSeq, exists := m["message_seq"]; exists && rawMsgSeq != nil {
+		msgSeq, ok := rawMsgSeq.(string)
+		if !ok {
+			return false
+		}
+		if n, err := U64(msgSeq); err != nil || n == 0 || n > 4294967295 {
+			return false
+		}
+	}
+	if rawSHA, exists := m["observed_payload_sha256"]; exists && rawSHA != nil {
+		sha, ok := rawSHA.(string)
+		if !ok || !validHex(sha, 64) {
+			return false
+		}
+	}
+	return nativeLexical(m)
+}
+
 func nativeRequest(r io.Reader) (map[string]any, []byte, error) {
 	v, e := decodeStrict(r, 32768)
 	if e != nil {
@@ -134,6 +207,12 @@ func nativeRequest(r io.Reader) (map[string]any, []byte, error) {
 		return nil, nil, ErrInvalid
 	}
 	op, _ := m["operation"].(string)
+	if op == "evaluate_current_access" {
+		if !validateEvaluateCurrentAccessRequest(m) {
+			return nil, nil, ErrInvalid
+		}
+		return m, canonical(m), nil
+	}
 	loadNativeSchemas()
 	if nativeSchemas.err != nil {
 		return nil, nil, ErrUnavailable
@@ -153,9 +232,19 @@ func nativeResponse(key Key, request map[string]any, body []byte) ([]byte, error
 	if !ok {
 		return nil, ErrUnavailable
 	}
-	s := nativeSchemas.response[request["operation"].(string)]
-	if s == nil || s.Validate(v) != nil || !nativeLexical(v) {
-		return nil, ErrUnavailable
+	op, _ := request["operation"].(string)
+	if op == "evaluate_current_access" {
+		if !nativeLexical(v) || m["schema_version"] != json.Number("1") || m["profile_version"] != json.Number("1") {
+			return nil, ErrUnavailable
+		}
+		if readID, ok := m["read_id"].(string); !ok || !validHex(readID, 32) {
+			return nil, ErrUnavailable
+		}
+	} else {
+		s := nativeSchemas.response[op]
+		if s == nil || s.Validate(v) != nil || !nativeLexical(v) {
+			return nil, ErrUnavailable
+		}
 	}
 	k, e := asObject(key)
 	if e != nil || !bytes.Equal(canonical(k), canonical(m["key"])) || m["request_id"] != request["request_id"] {
@@ -185,6 +274,52 @@ func nativeResponse(key Key, request map[string]any, body []byte) ([]byte, error
 		}
 		end, e := utcTime(a["completed_at"])
 		if e != nil || end.Before(start) || observed.Before(end) {
+			return nil, ErrUnavailable
+		}
+	}
+	if op == "evaluate_current_access" {
+		access, ok := m["access"].(map[string]any)
+		if !ok || len(canonical(access)) > 8192 {
+			return nil, ErrUnavailable
+		}
+		refs, ok := access["authority_refs"].([]any)
+		if !ok || len(refs) == 0 {
+			return nil, ErrUnavailable
+		}
+		kinds := map[string]bool{}
+		for _, r := range refs {
+			ns, ok := r.(string)
+			if !ok || ids[ns] == "" {
+				return nil, ErrUnavailable
+			}
+			kinds[ids[ns]] = true
+		}
+		if !kinds["sql"] || !kinds["im"] {
+			return nil, ErrUnavailable
+		}
+		if access["provenance"] != LiveIngressProvenanceV1 {
+			return nil, ErrUnavailable
+		}
+		if _, ok := access["trigger_row_persisted"].(bool); !ok {
+			return nil, ErrUnavailable
+		}
+		if _, ok := access["content_attested_by_server"].(bool); !ok {
+			return nil, ErrUnavailable
+		}
+		status, _ := access["status"].(string)
+		switch status {
+		case "unavailable":
+			if reason, ok := access["reason"].(string); !ok || reason == "" {
+				return nil, ErrUnavailable
+			}
+		case "evaluated":
+			if _, ok := access["eligible"].(bool); !ok {
+				return nil, ErrUnavailable
+			}
+			if _, ok := access["predicates"].(map[string]any); !ok {
+				return nil, ErrUnavailable
+			}
+		default:
 			return nil, ErrUnavailable
 		}
 	}
@@ -333,7 +468,7 @@ func (r *Runtime) Facts(ctx context.Context, key Key, body io.Reader) ([]byte, e
 	if e != nil {
 		return nil, e
 	}
-	defer t.tx.RollbackUnlessCommitted()
+	defer t.close()
 	if r.store.requireProvisionedScopeOnFacts {
 		if e := r.store.verifyProvisionedScope(ctx, t); e != nil {
 			return nil, e
@@ -400,7 +535,8 @@ func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte,
 			return DeliveryBindingRequestV1{}, nil, ErrInvalid
 		}
 	}
-	if m["schema_version"] != json.Number("1") || m["operation"] != "bind_delivery" {
+	op, _ := m["operation"].(string)
+	if m["schema_version"] != json.Number("1") || (op != "bind_delivery" && op != "bind_live_ingress") {
 		return DeliveryBindingRequestV1{}, nil, ErrInvalid
 	}
 	reqID, ok := m["request_id"].(string)
@@ -450,6 +586,7 @@ func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte,
 		expectedVer = s
 	}
 	out := DeliveryBindingRequestV1{
+		Operation:             op,
 		RequestID:             reqID,
 		ChannelType:           uint8(chTypeU64),
 		ChannelID:             chID,
@@ -541,6 +678,11 @@ func deliveryBindingResponse(key Key, req DeliveryBindingRequestV1, body []byte)
 			"native_message_version": true,
 			"authority_refs":         true,
 		}
+		if req.Operation == "bind_live_ingress" {
+			allowedBinding["provenance"] = true
+			allowedBinding["trigger_row_persisted"] = true
+			allowedBinding["content_attested_by_server"] = true
+		}
 		for bk := range binding {
 			if !allowedBinding[bk] {
 				return nil, ErrUnavailable
@@ -551,6 +693,17 @@ func deliveryBindingResponse(key Key, req DeliveryBindingRequestV1, body []byte)
 		}
 		if reason, ok := binding["reason"].(string); !ok || reason == "" {
 			return nil, ErrUnavailable
+		}
+		if req.Operation == "bind_live_ingress" {
+			if binding["provenance"] != LiveIngressProvenanceV1 {
+				return nil, ErrUnavailable
+			}
+			if _, ok := binding["trigger_row_persisted"].(bool); !ok {
+				return nil, ErrUnavailable
+			}
+			if _, ok := binding["content_attested_by_server"].(bool); !ok {
+				return nil, ErrUnavailable
+			}
 		}
 	case "bound":
 		allowedBinding := map[string]bool{
@@ -566,6 +719,11 @@ func deliveryBindingResponse(key Key, req DeliveryBindingRequestV1, body []byte)
 			"resolvable_purposes":     true,
 			"authority_refs":          true,
 		}
+		if req.Operation == "bind_live_ingress" {
+			allowedBinding["provenance"] = true
+			allowedBinding["trigger_row_persisted"] = true
+			allowedBinding["content_attested_by_server"] = true
+		}
 		for bk := range binding {
 			if !allowedBinding[bk] {
 				return nil, ErrUnavailable
@@ -580,6 +738,17 @@ func deliveryBindingResponse(key Key, req DeliveryBindingRequestV1, body []byte)
 		h, ok := binding["header"].(map[string]any)
 		if !ok || !nativeHeader(key, h) || h["payload_sha256"] != req.ObservedPayloadSHA256 {
 			return nil, ErrUnavailable
+		}
+		if req.Operation == "bind_live_ingress" {
+			if binding["provenance"] != LiveIngressProvenanceV1 {
+				return nil, ErrUnavailable
+			}
+			if _, ok := binding["trigger_row_persisted"].(bool); !ok {
+				return nil, ErrUnavailable
+			}
+			if _, ok := binding["content_attested_by_server"].(bool); !ok {
+				return nil, ErrUnavailable
+			}
 		}
 	default:
 		return nil, ErrUnavailable
@@ -601,7 +770,7 @@ func (r *Runtime) BindDeliveredMessage(ctx context.Context, key Key, body io.Rea
 	if e != nil {
 		return nil, e
 	}
-	defer t.tx.RollbackUnlessCommitted()
+	defer t.close()
 	if r.store.requireProvisionedScopeOnFacts {
 		if e := r.store.verifyProvisionedScope(ctx, t); e != nil {
 			return nil, e

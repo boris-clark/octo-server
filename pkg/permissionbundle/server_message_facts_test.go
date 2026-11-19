@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1553,7 +1554,7 @@ func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing
 	sess := conn.NewSession(nil)
 
 	for _, ddl := range []string{
-		"DROP TABLE IF EXISTS bot_permission_disclosure_permit, bot_permission_lineage, bot_permission_replay_journal, bot_permission_bundle_history, bot_permission_bundle_current, bot_permission_scope, channel_setting, channel_offset, message_user_extra, message_extra, message, thread, group_member, `group`, user_setting, friend, space_member, space, app_bot, robot, user",
+		"DROP TABLE IF EXISTS bot_permission_authority_lineage, bot_permission_disclosure_permit, bot_permission_lineage, bot_permission_replay_journal, bot_permission_bundle_history, bot_permission_bundle_current, bot_permission_scope, channel_setting, channel_offset, message_user_extra, message_extra, message, thread, group_member, `group`, user_setting, friend, space_member, space, app_bot, robot, user",
 		"CREATE TABLE user(id BIGINT PRIMARY KEY AUTO_INCREMENT, uid VARCHAR(128) NOT NULL UNIQUE, status INT NOT NULL, is_destroy INT NOT NULL DEFAULT 0, robot INT NOT NULL DEFAULT 0) ENGINE=InnoDB",
 		"CREATE TABLE robot(id BIGINT PRIMARY KEY AUTO_INCREMENT, robot_id VARCHAR(128) NOT NULL UNIQUE, creator_uid VARCHAR(128) NOT NULL, status INT NOT NULL) ENGINE=InnoDB",
 		"CREATE TABLE app_bot(id BIGINT PRIMARY KEY AUTO_INCREMENT, uid VARCHAR(128) NOT NULL UNIQUE, status INT NOT NULL DEFAULT 0) ENGINE=InnoDB",
@@ -1570,6 +1571,7 @@ func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing
 		"CREATE TABLE channel_offset(uid VARCHAR(128) NOT NULL, channel_id VARCHAR(191) NOT NULL, channel_type INT NOT NULL, message_seq BIGINT NOT NULL, PRIMARY KEY(uid, channel_id, channel_type)) ENGINE=InnoDB",
 		"CREATE TABLE channel_setting(channel_id VARCHAR(191) NOT NULL, channel_type INT NOT NULL, offset_message_seq BIGINT NOT NULL, PRIMARY KEY(channel_id, channel_type)) ENGINE=InnoDB",
 		"CREATE TABLE bot_permission_scope(bot_uid VARBINARY(128) NOT NULL, space_id VARBINARY(128) NOT NULL, scope_incarnation VARBINARY(128) NOT NULL UNIQUE, revision VARCHAR(64) NOT NULL, context_epoch VARCHAR(64) NOT NULL, schema_version INT NOT NULL, catalog_version VARCHAR(64) NOT NULL, catalog_digest VARBINARY(128) NOT NULL, bundle_json LONGTEXT NOT NULL, bundle_digest VARBINARY(128) NOT NULL, native_anchor_json LONGTEXT NOT NULL, native_anchor_digest VARBINARY(128) NOT NULL, retired INT NOT NULL DEFAULT 0, updated_by VARCHAR(128) NULL, updated_at DATETIME(6) NOT NULL, PRIMARY KEY(bot_uid, space_id)) ENGINE=InnoDB",
+		NativeAuthorityLineageDDL,
 		ServerDisclosurePermitDDL,
 	} {
 		_, err := sess.Exec(ddl)
@@ -1596,7 +1598,18 @@ func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing
 		require.NoError(t, err, seedQ)
 	}
 
-	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	driver, err := NewNativeSingleWriterLineageDriver(NativeSingleWriterLineageConfig{
+		Session:       sess,
+		Origin:        fixtureKey.Origin,
+		AuthorityID:   "mysql8-single-writer-test",
+		Incarnation:   strings.Repeat("a", 32),
+		CatalogDigest: fixturePin.Digest,
+		StatePath:     filepath.Join(t.TempDir(), "mysql8-authority-state.json"),
+		Key:           []byte(strings.Repeat("m", 32)),
+		Provision:     true,
+		testNoLocks:   false,
+	})
+	require.NoError(t, err)
 	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
 	require.NoError(t, err)
 	s := Store{
@@ -1775,4 +1788,609 @@ func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing
 	require.NoError(t, err)
 	require.Equal(t, "refused", fixtureObject(t, revOut)["binding"].(map[string]any)["status"])
 	require.Equal(t, "expired_reference", fixtureObject(t, revOut)["binding"].(map[string]any)["reason"])
+
+	// 4. Asynchronous ingress separation on real MySQL 8 with NO trigger message row in `message`:
+	unpersistedDigest := sha256OfJSON(map[string]any{"type": 1, "content": "MYSQL-UNPERSISTED-LIVE-TRIGGER"})
+	// Verify stored-row bind_delivery refuses with mirror_lag when row is not in MySQL:
+	lagOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-unpersisted-lag-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "2123339999999990001",
+		"message_seq":             "99",
+		"from_uid":                "peer",
+		"observed_payload_sha256": unpersistedDigest,
+	})))
+	require.NoError(t, err)
+	require.Equal(t, "refused", fixtureObject(t, lagOut)["binding"].(map[string]any)["status"])
+	require.Equal(t, "mirror_lag", fixtureObject(t, lagOut)["binding"].(map[string]any)["reason"])
+
+	// bind_live_ingress succeeds on real MySQL 8 without the trigger row (seq 99 > channel_offset 1):
+	liveGrpOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_live_ingress",
+		"request_id":              "mysql-live-grp-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "2123339999999990001",
+		"message_seq":             "99",
+		"from_uid":                "peer",
+		"observed_payload_sha256": unpersistedDigest,
+	})))
+	require.NoError(t, err)
+	liveGrpBinding := fixtureObject(t, liveGrpOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", liveGrpBinding["status"])
+	require.Equal(t, LiveIngressProvenanceV1, liveGrpBinding["provenance"])
+	require.Equal(t, false, liveGrpBinding["trigger_row_persisted"])
+	require.Equal(t, false, liveGrpBinding["content_attested_by_server"])
+	require.Equal(t, LiveUnpersistedMessageVersionV1, liveGrpBinding["native_message_version"])
+	require.Equal(t, []any{"admit", "reply"}, liveGrpBinding["resolvable_purposes"].([]any))
+	liveGrpDelivRef := liveGrpBinding["delivery_reference"].(string)
+	require.True(t, strings.HasPrefix(liveGrpDelivRef, "l1-"))
+
+	// resolve(admit) and resolve(reply) with l1-... succeed on real MySQL 8 without the trigger row:
+	for idx, purpose := range []string{"admit", "reply"} {
+		resLiveOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      strings.Repeat("a", 31) + strconv.Itoa(idx),
+			"operation":       "resolve",
+			"purpose":         purpose,
+			"references": []any{
+				map[string]any{"delivery_reference": liveGrpDelivRef},
+			},
+		})))
+		require.NoError(t, err)
+		resLiveItem := fixtureObject(t, resLiveOut)["results"].([]any)[0].(map[string]any)
+		require.Equal(t, "resolved", resLiveItem["status"])
+		for k, v := range resLiveItem["predicates"].(map[string]any) {
+			require.Equal(t, true, v, "mysql live resolve %s pred %s", purpose, k)
+		}
+	}
+
+	// evaluate_current_access succeeds on real MySQL 8 without the trigger row:
+	evalLiveOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"profile_version":         json.Number("1"),
+		"request_id":              "mysql-live-eval-admit",
+		"operation":               "evaluate_current_access",
+		"purpose":                 "admit",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"caller_uid":              "peer",
+		"message_id":              "2123339999999990001",
+		"message_seq":             "99",
+		"observed_payload_sha256": unpersistedDigest,
+	})))
+	require.NoError(t, err)
+	evalAccess := fixtureObject(t, evalLiveOut)["access"].(map[string]any)
+	require.Equal(t, "evaluated", evalAccess["status"])
+	require.Equal(t, true, evalAccess["eligible"])
+	require.Equal(t, "group_admit_v1", evalAccess["profile"])
+	require.Equal(t, false, evalAccess["trigger_row_persisted"])
+	require.Equal(t, false, evalAccess["content_attested_by_server"])
+
+	// 5. Concurrent single-writer lineage (NativeSingleWriterLineageDriver with real MySQL 8 InnoDB locks):
+	var wg sync.WaitGroup
+	errCh := make(chan error, 16)
+	for worker := 0; worker < 4; worker++ {
+		w := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for iter := 0; iter < 3; iter++ {
+				bOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+					"schema_version":          json.Number("1"),
+					"operation":               "bind_live_ingress",
+					"request_id":              "mysql-conc-bind-" + strconv.Itoa(w) + "-" + strconv.Itoa(iter),
+					"channel_type":            json.Number("2"),
+					"channel_id":              "group",
+					"message_id":              strconv.Itoa(9800000 + w*100 + iter),
+					"message_seq":             strconv.Itoa(200 + w*10 + iter),
+					"from_uid":                "peer",
+					"observed_payload_sha256": unpersistedDigest,
+				})))
+				if err != nil {
+					errCh <- err
+					return
+				}
+				dRef := fixtureObject(t, bOut)["binding"].(map[string]any)["delivery_reference"].(string)
+				_, err = rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+					"schema_version":  json.Number("1"),
+					"profile_version": json.Number("1"),
+					"request_id":      strings.Repeat("e", 30) + strconv.Itoa(w) + strconv.Itoa(iter),
+					"operation":       "resolve",
+					"purpose":         "admit",
+					"references": []any{
+						map[string]any{"delivery_reference": dRef},
+					},
+				})))
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
 }
+
+func TestServerMessageFactsAsyncIngressSeparationWithoutTriggerRow(t *testing.T) {
+	ctx := t.Context()
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f := newServerFacts(t)
+	f.s.Authority = authority
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	_, err = f.s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	adapter, err := NewSQLNativeFactAdapter(authority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	// Confirm the `message` table has zero rows for our live ingress messages.
+	dmPayload := map[string]any{"type": 1, "content": "LIVE-UNPERSISTED-DM"}
+	dmDigest := sha256OfJSON(dmPayload)
+	grpPayload := map[string]any{"type": 1, "content": "LIVE-UNPERSISTED-GROUP"}
+	grpDigest := sha256OfJSON(grpPayload)
+	thdPayload := map[string]any{"type": 1, "content": "LIVE-UNPERSISTED-THREAD"}
+	thdDigest := sha256OfJSON(thdPayload)
+
+	callBindOp := func(op, reqID string, chType uint8, chID, msgID, seq, fromUID, digest string) map[string]any {
+		out, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":          json.Number("1"),
+			"operation":               op,
+			"request_id":              reqID,
+			"channel_type":            json.Number(strconv.FormatUint(uint64(chType), 10)),
+			"channel_id":              chID,
+			"message_id":              msgID,
+			"message_seq":             seq,
+			"from_uid":                fromUID,
+			"observed_payload_sha256": digest,
+		})))
+		require.NoError(t, err)
+		return fixtureObject(t, out)["binding"].(map[string]any)
+	}
+
+	callEvalAccess := func(reqID, purpose string, chType uint8, chID, callerUID, msgID, seq, digest string) map[string]any {
+		req := map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      reqID,
+			"operation":       "evaluate_current_access",
+			"purpose":         purpose,
+			"channel_type":    json.Number(strconv.FormatUint(uint64(chType), 10)),
+			"channel_id":      chID,
+			"caller_uid":      callerUID,
+		}
+		if msgID != "" {
+			req["message_id"] = msgID
+		}
+		if seq != "" {
+			req["message_seq"] = seq
+		}
+		if digest != "" {
+			req["observed_payload_sha256"] = digest
+		}
+		out, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(req)))
+		require.NoError(t, err)
+		return fixtureObject(t, out)["access"].(map[string]any)
+	}
+
+	// 1. Stored-row bind_delivery still fails closed with mirror_lag when the row is not in MySQL.
+	for _, tc := range []struct {
+		name   string
+		chType uint8
+		chID   string
+		msgID  string
+		seq    string
+		digest string
+	}{
+		{"dm_bare_peer", 1, "peer", "9100001", "10", dmDigest},
+		{"group", 2, "group", "9100002", "11", grpDigest},
+		{"thread", 5, f.threadCh, "9100003", "12", thdDigest},
+	} {
+		b := callBindOp("bind_delivery", "req-stored-lag-"+tc.name, tc.chType, tc.chID, tc.msgID, tc.seq, "peer", tc.digest)
+		require.Equal(t, "refused", b["status"], tc.name)
+		require.Equal(t, "mirror_lag", b["reason"], tc.name)
+	}
+
+	// 2. bind_live_ingress succeeds across DM (bare peer and canonical pair), Group, and Thread with zero rows in `message`.
+	dmBind := callBindOp("bind_live_ingress", "req-live-dm-peer", 1, "peer", "9100001", "10", "peer", dmDigest)
+	require.Equal(t, "bound", dmBind["status"])
+	require.Equal(t, LiveIngressProvenanceV1, dmBind["provenance"])
+	require.Equal(t, false, dmBind["trigger_row_persisted"])
+	require.Equal(t, false, dmBind["content_attested_by_server"])
+	require.Equal(t, LiveUnpersistedMessageVersionV1, dmBind["native_message_version"])
+	require.Equal(t, []any{"admit", "reply"}, dmBind["resolvable_purposes"].([]any))
+	dmLiveDelivRef := dmBind["delivery_reference"].(string)
+	dmLiveHdrRef := dmBind["header_reference"].(string)
+	require.True(t, strings.HasPrefix(dmLiveDelivRef, "l1-"))
+	require.True(t, strings.HasPrefix(dmLiveHdrRef, "l2-"))
+
+	dmPairBind := callBindOp("bind_live_ingress", "req-live-dm-pair", 1, f.dmChan, "9100001", "10", "peer", dmDigest)
+	require.Equal(t, "bound", dmPairBind["status"])
+	require.Equal(t, dmLiveDelivRef, dmPairBind["delivery_reference"], "bare peer and canonical DM pair mint identical l1 reference")
+
+	grpBind := callBindOp("bind_live_ingress", "req-live-grp", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "bound", grpBind["status"])
+	require.Equal(t, false, grpBind["trigger_row_persisted"])
+	require.Equal(t, false, grpBind["content_attested_by_server"])
+	grpLiveDelivRef := grpBind["delivery_reference"].(string)
+	grpLiveHdrRef := grpBind["header_reference"].(string)
+
+	thdBind := callBindOp("bind_live_ingress", "req-live-thd", 5, f.threadCh, "9100003", "12", "peer", thdDigest)
+	require.Equal(t, "bound", thdBind["status"])
+	require.Equal(t, false, thdBind["trigger_row_persisted"])
+	require.Equal(t, false, thdBind["content_attested_by_server"])
+	thdLiveDelivRef := thdBind["delivery_reference"].(string)
+	thdLiveHdrRef := thdBind["header_reference"].(string)
+
+	// 3. resolve(admit) and resolve(reply) with l1-... succeed with all predicates true and byte-identical headers.
+	admitHeaders := map[string]string{}
+	for pIdx, purpose := range []string{"admit", "reply"} {
+		resOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      strings.Repeat("b", 31) + strconv.Itoa(pIdx),
+			"operation":       "resolve",
+			"purpose":         purpose,
+			"references": []any{
+				map[string]any{"delivery_reference": dmLiveDelivRef},
+				map[string]any{"delivery_reference": grpLiveDelivRef},
+				map[string]any{"delivery_reference": thdLiveDelivRef},
+			},
+		})))
+		require.NoError(t, err)
+		results := fixtureObject(t, resOut)["results"].([]any)
+		require.Len(t, results, 3)
+		for idx, raw := range results {
+			item := raw.(map[string]any)
+			require.Equal(t, "resolved", item["status"], "%s idx %d", purpose, idx)
+			hdrJSON := string(canonical(item["header"]))
+			if purpose == "admit" {
+				admitHeaders[item["reference"].(string)] = hdrJSON
+			} else {
+				require.Equal(t, admitHeaders[item["reference"].(string)], hdrJSON, "admit and reply headers must be byte-identical")
+			}
+			for k, v := range item["predicates"].(map[string]any) {
+				require.Equal(t, true, v, "%s idx %d pred %s", purpose, idx, k)
+			}
+		}
+	}
+
+	// 4. resolve(contributor) with unpersisted l1-... is refused with mirror_lag (no fake content attestation).
+	contribOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("c", 32),
+		"operation":       "resolve",
+		"purpose":         "contributor",
+		"references": []any{
+			map[string]any{"delivery_reference": dmLiveDelivRef},
+			map[string]any{"delivery_reference": grpLiveDelivRef},
+			map[string]any{"delivery_reference": thdLiveDelivRef},
+		},
+	})))
+	require.NoError(t, err)
+	for _, raw := range fixtureObject(t, contribOut)["results"].([]any) {
+		item := raw.(map[string]any)
+		require.Equal(t, "unavailable", item["status"])
+		require.Equal(t, "mirror_lag", item["reason"])
+	}
+
+	// 5. history_disclosure rejects l2-... live header references with predicate_unsupported.
+	hdLiveOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("d", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("1", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": dmLiveHdrRef},
+			map[string]any{"header_reference": grpLiveHdrRef},
+			map[string]any{"header_reference": thdLiveHdrRef},
+		},
+	})))
+	require.NoError(t, err)
+	for _, raw := range fixtureObject(t, hdLiveOut)["results"].([]any) {
+		item := raw.(map[string]any)
+		require.Equal(t, "unavailable", item["status"])
+		require.Equal(t, "predicate_unsupported", item["reason"])
+	}
+
+	// 6. evaluate_current_access succeeds for DM, Group, and Thread (both admit and reply, with or without message fields).
+	for _, purpose := range []string{"admit", "reply"} {
+		dmAcc := callEvalAccess("req-eval-dm-"+purpose, purpose, 1, "peer", "peer", "9100001", "10", dmDigest)
+		require.Equal(t, "evaluated", dmAcc["status"])
+		require.Equal(t, true, dmAcc["eligible"])
+		require.Equal(t, "dm_"+purpose+"_v1", dmAcc["profile"])
+		require.Equal(t, false, dmAcc["trigger_row_persisted"])
+		require.Equal(t, false, dmAcc["content_attested_by_server"])
+
+		grpAcc := callEvalAccess("req-eval-grp-"+purpose, purpose, 2, "group", "peer", "", "", "")
+		require.Equal(t, "evaluated", grpAcc["status"])
+		require.Equal(t, true, grpAcc["eligible"])
+		require.Equal(t, "group_"+purpose+"_v1", grpAcc["profile"])
+		require.Equal(t, false, grpAcc["trigger_row_persisted"])
+		require.Equal(t, false, grpAcc["content_attested_by_server"])
+
+		thdAcc := callEvalAccess("req-eval-thd-"+purpose, purpose, 5, f.threadCh, "peer", "9100003", "12", thdDigest)
+		require.Equal(t, "evaluated", thdAcc["status"])
+		require.Equal(t, true, thdAcc["eligible"])
+		require.Equal(t, "thread_"+purpose+"_v1", thdAcc["profile"])
+		require.Equal(t, false, thdAcc["trigger_row_persisted"])
+		require.Equal(t, false, thdAcc["content_attested_by_server"])
+	}
+
+	// 7. Mid-turn asynchronous arrival of the group message row into `message`:
+	// - resolve(reply) on the already-minted l1-... reference keeps the exact same header so sameHeader checks never fail!
+	// - resolve(contributor) on that l1-... reference now succeeds because the row is persisted and attested.
+	// - new bind_live_ingress and evaluate_current_access calls report trigger_row_persisted=true, content_attested_by_server=true.
+	grpBytes, _ := json.Marshal(grpPayload)
+	f.exec("INSERT INTO message VALUES('9100002',11,'peer','group',2,1700000050,?,0,0)", string(grpBytes))
+
+	resAfterArrivalOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("e", 32),
+		"operation":       "resolve",
+		"purpose":         "reply",
+		"references": []any{
+			map[string]any{"delivery_reference": grpLiveDelivRef},
+		},
+	})))
+	require.NoError(t, err)
+	resAfterItem := fixtureObject(t, resAfterArrivalOut)["results"].([]any)[0].(map[string]any)
+	require.Equal(t, "resolved", resAfterItem["status"])
+	require.Equal(t, admitHeaders[grpLiveDelivRef], string(canonical(resAfterItem["header"])), "header must remain byte-identical even after async row arrival mid-turn")
+
+	contribAfterOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("f", 32),
+		"operation":       "resolve",
+		"purpose":         "contributor",
+		"references": []any{
+			map[string]any{"delivery_reference": grpLiveDelivRef},
+		},
+	})))
+	require.NoError(t, err)
+	contribAfterItem := fixtureObject(t, contribAfterOut)["results"].([]any)[0].(map[string]any)
+	require.Equal(t, "resolved", contribAfterItem["status"])
+
+	grpBindPersisted := callBindOp("bind_live_ingress", "req-live-grp-persisted", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "bound", grpBindPersisted["status"])
+	require.Equal(t, true, grpBindPersisted["trigger_row_persisted"])
+	require.Equal(t, true, grpBindPersisted["content_attested_by_server"])
+	require.Equal(t, []any{"admit", "contributor", "reply"}, grpBindPersisted["resolvable_purposes"].([]any))
+
+	grpAccPersisted := callEvalAccess("req-eval-grp-persisted", "admit", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", grpAccPersisted["status"])
+	require.Equal(t, true, grpAccPersisted["eligible"])
+	require.Equal(t, true, grpAccPersisted["trigger_row_persisted"])
+	require.Equal(t, true, grpAccPersisted["content_attested_by_server"])
+
+	// 8. Negative persisted-row conflict fixtures:
+	// - Payload digest mismatch (e.g. caller spoofed digest or message was edited) -> payload_digest_mismatch
+	wrongDigest := sha256OfJSON(map[string]any{"type": 1, "content": "TAMPERED"})
+	mismatchBind := callBindOp("bind_live_ingress", "req-live-grp-digest-mismatch", 2, "group", "9100002", "11", "peer", wrongDigest)
+	require.Equal(t, "refused", mismatchBind["status"])
+	require.Equal(t, "payload_digest_mismatch", mismatchBind["reason"])
+	require.Equal(t, true, mismatchBind["trigger_row_persisted"])
+	require.Equal(t, false, mismatchBind["content_attested_by_server"])
+
+	mismatchEval := callEvalAccess("req-eval-grp-digest-mismatch", "admit", 2, "group", "peer", "9100002", "11", wrongDigest)
+	require.Equal(t, "unavailable", mismatchEval["status"])
+	require.Equal(t, "payload_digest_mismatch", mismatchEval["reason"])
+	require.Equal(t, true, mismatchEval["trigger_row_persisted"])
+	require.Equal(t, false, mismatchEval["content_attested_by_server"])
+
+	// - Identity mismatch (wrong sender or wrong seq compared to stored row) -> identity_mismatch
+	idMismatchBind := callBindOp("bind_live_ingress", "req-live-grp-id-mismatch", 2, "group", "9100002", "999", "peer", grpDigest)
+	require.Equal(t, "refused", idMismatchBind["status"])
+	require.Equal(t, "identity_mismatch", idMismatchBind["reason"])
+
+	// - Revoked row in message_extra -> expired_reference on bind_live_ingress, resolve(l1-...), and evaluate_current_access
+	f.exec("INSERT INTO message_extra VALUES('9100002',1,1,0,NULL,'')")
+	revokedBind := callBindOp("bind_live_ingress", "req-live-grp-revoked", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "refused", revokedBind["status"])
+	require.Equal(t, "expired_reference", revokedBind["reason"])
+
+	revokedResOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("9", 32),
+		"operation":       "resolve",
+		"purpose":         "reply",
+		"references": []any{
+			map[string]any{"delivery_reference": grpLiveDelivRef},
+		},
+	})))
+	require.NoError(t, err)
+	revokedResItem := fixtureObject(t, revokedResOut)["results"].([]any)[0].(map[string]any)
+	require.Equal(t, "unavailable", revokedResItem["status"])
+	require.Equal(t, "expired_reference", revokedResItem["reason"])
+
+	revokedEval := callEvalAccess("req-eval-grp-revoked", "reply", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "unavailable", revokedEval["status"])
+	require.Equal(t, "expired_reference", revokedEval["reason"])
+
+	// Clean up message 9100002 so we test pure unpersisted negative ACL fixtures next.
+	f.exec("DELETE FROM message_extra WHERE message_id='9100002'")
+	f.exec("DELETE FROM message WHERE message_id='9100002'")
+
+	// 9. Negative live ACL fixtures with NO trigger row in `message`:
+	// - Join-time / clear-history cutoff (channel_offset.message_seq = 15 >= seq 11)
+	f.exec("INSERT INTO channel_offset VALUES('bot','group',2,15)")
+	offsetBind := callBindOp("bind_live_ingress", "req-live-grp-offset", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "refused", offsetBind["status"])
+	require.Equal(t, "visibility_denied", offsetBind["reason"])
+
+	offsetEval := callEvalAccess("req-eval-grp-offset", "admit", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", offsetEval["status"])
+	require.Equal(t, false, offsetEval["eligible"])
+	require.Equal(t, false, offsetEval["predicates"].(map[string]any)["bot_current_read"])
+	f.exec("DELETE FROM channel_offset WHERE uid='bot' AND channel_id='group'")
+
+	// - Caller removed from group (group_member.is_deleted = 1)
+	f.exec("UPDATE group_member SET is_deleted=1 WHERE group_no='group' AND uid='peer'")
+	removedCallerBind := callBindOp("bind_live_ingress", "req-live-grp-removed-caller", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "refused", removedCallerBind["status"])
+	require.Equal(t, "visibility_denied", removedCallerBind["reason"])
+
+	removedCallerEval := callEvalAccess("req-eval-grp-removed-caller", "admit", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", removedCallerEval["status"])
+	require.Equal(t, false, removedCallerEval["eligible"])
+	require.Equal(t, false, removedCallerEval["predicates"].(map[string]any)["caller_group_active_member"])
+	require.Equal(t, false, removedCallerEval["predicates"].(map[string]any)["caller_current_read"])
+	f.exec("UPDATE group_member SET is_deleted=0 WHERE group_no='group' AND uid='peer'")
+
+	// - Bot removed from group (group_member.is_deleted = 1)
+	f.exec("UPDATE group_member SET is_deleted=1 WHERE group_no='group' AND uid='bot'")
+	removedBotBind := callBindOp("bind_live_ingress", "req-live-grp-removed-bot", 2, "group", "9100002", "11", "peer", grpDigest)
+	require.Equal(t, "refused", removedBotBind["status"])
+	require.Equal(t, "visibility_denied", removedBotBind["reason"])
+
+	removedBotEval := callEvalAccess("req-eval-grp-removed-bot", "reply", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", removedBotEval["status"])
+	require.Equal(t, false, removedBotEval["eligible"])
+	require.Equal(t, false, removedBotEval["predicates"].(map[string]any)["bot_group_active_member"])
+	require.Equal(t, false, removedBotEval["predicates"].(map[string]any)["bot_current_send"])
+	f.exec("UPDATE group_member SET is_deleted=0 WHERE group_no='group' AND uid='bot'")
+
+	// - Disbanded group (group.status = 2) denies reply
+	f.exec("UPDATE `group` SET status=2 WHERE group_no='group'")
+	disbandedEval := callEvalAccess("req-eval-grp-disbanded", "reply", 2, "group", "peer", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", disbandedEval["status"])
+	require.Equal(t, false, disbandedEval["eligible"])
+	require.Equal(t, false, disbandedEval["predicates"].(map[string]any)["source_exists"])
+	require.Equal(t, false, disbandedEval["predicates"].(map[string]any)["bot_current_send"])
+	f.exec("UPDATE `group` SET status=1 WHERE group_no='group'")
+
+	// - Deleted thread (thread.status = 3)
+	f.exec("UPDATE thread SET status=3 WHERE group_no=? AND short_id='123456789012345'", f.parent)
+	delThreadBind := callBindOp("bind_live_ingress", "req-live-thd-deleted", 5, f.threadCh, "9100003", "12", "peer", thdDigest)
+	require.Equal(t, "refused", delThreadBind["status"])
+	require.Equal(t, "expired_reference", delThreadBind["reason"])
+	f.exec("UPDATE thread SET status=1 WHERE group_no=? AND short_id='123456789012345'", f.parent)
+
+	// - Non-human caller (robot=1) resolves unsupported_principal_v1 with eligible=false
+	nonHumanEval := callEvalAccess("req-eval-nonhuman", "admit", 2, "group", "bot", "9100002", "11", grpDigest)
+	require.Equal(t, "evaluated", nonHumanEval["status"])
+	require.Equal(t, false, nonHumanEval["eligible"])
+	require.Equal(t, "unsupported_principal_v1", nonHumanEval["profile"])
+}
+
+func TestServerMessageFactsNativeSingleWriterLineageConcurrentLiveIngress(t *testing.T) {
+	ctx := t.Context()
+	f := newServerFacts(t)
+	f.exec("DELETE FROM bot_permission_scope")
+	f.exec(NativeAuthorityLineageDDL)
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	// Replace the synthetic authority with NativeSingleWriterLineageDriver so concurrent
+	// BindDeliveredMessage and Facts calls exercise the real single-writer lineage table locking.
+	driver, err := NewNativeSingleWriterLineageDriver(NativeSingleWriterLineageConfig{
+		Session:       f.s.Session,
+		Origin:        fixtureKey.Origin,
+		AuthorityID:   "sqlite-single-writer-test",
+		Incarnation:   strings.Repeat("a", 32),
+		CatalogDigest: fixturePin.Digest,
+		StatePath:     filepath.Join(t.TempDir(), "authority-state.json"),
+		Key:           []byte(strings.Repeat("m", 32)),
+		Provision:     true,
+		testNoLocks:   true,
+	})
+	require.NoError(t, err)
+	nativeAuthority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f.s.Authority = nativeAuthority
+
+	tx, err := f.s.Session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	anchor, err := f.s.Native.Scope(ctx, tx, fixtureKey, "owner", strings.Repeat("a", 32))
+	require.NoError(t, err)
+	require.NoError(t, f.s.ProvisionSuffix(ctx, tx, fixtureKey, anchor, fixturePin))
+	require.NoError(t, tx.Commit())
+
+	_, err = f.s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	adapter, err := NewSQLNativeFactAdapter(nativeAuthority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	digest := sha256OfJSON(map[string]any{"type": 1, "content": "CONCURRENT-LIVE-INGRESS"})
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 24)
+	for worker := 0; worker < 6; worker++ {
+		w := worker
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for iter := 0; iter < 4; iter++ {
+				reqID := "conc-bind-" + strconv.Itoa(w) + "-" + strconv.Itoa(iter)
+				bindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+					"schema_version":          json.Number("1"),
+					"operation":               "bind_live_ingress",
+					"request_id":              reqID,
+					"channel_type":            json.Number("2"),
+					"channel_id":              "group",
+					"message_id":              strconv.Itoa(9500000 + w*100 + iter),
+					"message_seq":             strconv.Itoa(100 + w*10 + iter),
+					"from_uid":                "peer",
+					"observed_payload_sha256": digest,
+				})))
+				if err != nil {
+					errCh <- err
+					return
+				}
+				delivRef := fixtureObject(t, bindOut)["binding"].(map[string]any)["delivery_reference"].(string)
+				resReqID := strings.Repeat("a", 30) + strconv.Itoa(w) + strconv.Itoa(iter)
+				_, err = rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+					"schema_version":  json.Number("1"),
+					"profile_version": json.Number("1"),
+					"request_id":      resReqID,
+					"operation":       "resolve",
+					"purpose":         "admit",
+					"references": []any{
+						map[string]any{"delivery_reference": delivRef},
+					},
+				})))
+				if err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+}
+

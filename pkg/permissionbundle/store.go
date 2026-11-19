@@ -79,38 +79,65 @@ type header struct {
 	attribution  Attribution
 }
 type scopeTx struct {
-	tx        *dbr.Tx
-	authority AuthorityRead
-	anchor    NativeAnchor
-	key       Key
-	actor     string
+	tx          *dbr.Tx
+	authority   AuthorityRead
+	anchor      NativeAnchor
+	key         Key
+	actor       string
+	releaseGate func()
+}
+
+func (t *scopeTx) close() {
+	if t == nil {
+		return
+	}
+	if t.tx != nil {
+		t.tx.RollbackUnlessCommitted()
+	}
+	if t.releaseGate != nil {
+		t.releaseGate()
+	}
 }
 
 func (s Store) begin(ctx context.Context, key Key, actor string) (*scopeTx, error) {
 	if s.Session == nil || s.Native == nil || s.Authority == nil || s.Releases == nil || key.Origin != s.Origin || !key.Valid() || actor != "" && !ValidNativeID(actor) {
 		return nil, ErrUnavailable
 	}
+	releaseGate := func() {}
+	if gated, ok := s.Authority.(interface {
+		acquireTxGate(context.Context) (func(), error)
+	}); ok {
+		var err error
+		releaseGate, err = gated.acquireTxGate(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
 	session := *s.Session
 	session.EventReceiver = &dbr.NullEventReceiver{}
 	tx, e := session.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if e != nil {
+		releaseGate()
 		return nil, ErrUnavailable
 	}
 	a, e := s.Authority.Begin(ctx, tx)
 	if e != nil || a == nil || a.Incarnation() == "" {
 		tx.RollbackUnlessCommitted()
+		releaseGate()
 		return nil, ErrUnavailable
 	}
 	anchor, e := s.Native.Scope(ctx, tx, key, actor, a.Incarnation())
 	if e != nil {
 		tx.RollbackUnlessCommitted()
+		releaseGate()
 		return nil, e
 	}
 	if !validAnchor(anchor) || anchor.AuthorityIncarnation != a.Incarnation() {
 		tx.RollbackUnlessCommitted()
+		releaseGate()
 		return nil, ErrUnavailable
 	}
-	return &scopeTx{tx, a, anchor, key, actor}, nil
+	return &scopeTx{tx, a, anchor, key, actor, releaseGate}, nil
 }
 func validAnchor(a NativeAnchor) bool {
 	if !validHex(a.AuthorityIncarnation, 32) || !ValidNativeID(a.CreatorUID) {
@@ -183,7 +210,7 @@ func (s Store) Get(ctx context.Context, key Key, actor string) (OwnerResponse, e
 	if e != nil {
 		return OwnerResponse{}, e
 	}
-	defer t.tx.RollbackUnlessCommitted()
+	defer t.close()
 	h, e := s.read(ctx, t, "SHARE")
 	if e != nil {
 		return OwnerResponse{}, e
@@ -231,7 +258,7 @@ func (s Store) Mutate(ctx context.Context, key Key, actor string, r io.Reader) (
 	if e != nil {
 		return OwnerResponse{}, e
 	}
-	defer t.tx.RollbackUnlessCommitted()
+	defer t.close()
 	m, e := ParseMutation(r)
 	if e != nil {
 		return OwnerResponse{}, e
@@ -310,7 +337,7 @@ func (s Store) Prepare(ctx context.Context, key Key, actor string, r io.Reader) 
 	if e != nil {
 		return Prepared{}, e
 	}
-	defer t.tx.RollbackUnlessCommitted()
+	defer t.close()
 	req, e := ParsePreparation(r)
 	if e != nil {
 		return Prepared{}, e

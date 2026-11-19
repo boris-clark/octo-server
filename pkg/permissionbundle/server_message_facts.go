@@ -49,9 +49,14 @@ import (
 const (
 	serverMessageStreamID = "octo-server-message-store"
 
-	serverRefDelivery = "s1"
-	serverRefHeader   = "h1"
-	serverRefSource   = "c1"
+	serverRefDelivery     = "s1"
+	serverRefHeader       = "h1"
+	serverRefSource       = "c1"
+	serverRefLiveDelivery = "l1"
+	serverRefLiveHeader   = "l2"
+
+	LiveIngressProvenanceV1          = "live_channel_acl_v1"
+	LiveUnpersistedMessageVersionV1  = "live_unpersisted_v1"
 
 	channelTypePerson = 1
 	channelTypeGroup  = 2
@@ -200,6 +205,94 @@ func decodeServerRef(prefix, ref string) (serverRef, bool) {
 // endpoint ("" means unknown and makes resolve non-serving for that reference).
 func ServerDeliveryReference(channelType uint8, channelID, messageID, version string) string {
 	return encodeServerRef(serverRefDelivery, serverRef{channelType: channelType, channelID: channelID, messageID: messageID, version: version})
+}
+
+type serverLiveRef struct {
+	kind          string
+	channelType   uint8
+	channelID     string
+	messageID     string
+	messageSeq    string
+	seq           uint32
+	fromUID       string
+	payloadSHA256 string
+}
+
+func encodeServerLiveRef(prefix string, r serverLiveRef) string {
+	return prefix + "-" +
+		strconv.Itoa(int(r.channelType)) + "-" +
+		hex.EncodeToString([]byte(r.channelID)) + "-" +
+		r.messageID + "-" +
+		r.messageSeq + "-" +
+		hex.EncodeToString([]byte(r.fromUID)) + "-" +
+		strings.ToLower(r.payloadSHA256)
+}
+
+func decodeServerLiveRef(prefix, ref string) (serverLiveRef, bool) {
+	parts := strings.Split(ref, "-")
+	if len(parts) != 7 || parts[0] != prefix {
+		return serverLiveRef{}, false
+	}
+	t, err := strconv.Atoi(parts[1])
+	if err != nil || (t != channelTypePerson && t != channelTypeGroup && t != channelTypeThread) {
+		return serverLiveRef{}, false
+	}
+	ch, err := hex.DecodeString(parts[2])
+	if err != nil || len(ch) == 0 || len(ch) > 256 || parts[2] != hex.EncodeToString(ch) {
+		return serverLiveRef{}, false
+	}
+	msgIDNum, err := U64(parts[3])
+	if err != nil || msgIDNum == 0 || msgIDNum > 9223372036854775807 {
+		return serverLiveRef{}, false
+	}
+	seqNum, err := U64(parts[4])
+	if err != nil || seqNum == 0 || seqNum > 4294967295 {
+		return serverLiveRef{}, false
+	}
+	uidBytes, err := hex.DecodeString(parts[5])
+	if err != nil || len(uidBytes) == 0 || parts[5] != hex.EncodeToString(uidBytes) || !ValidNativeID(string(uidBytes)) {
+		return serverLiveRef{}, false
+	}
+	if !validHex(parts[6], 64) {
+		return serverLiveRef{}, false
+	}
+	return serverLiveRef{
+		kind:          prefix,
+		channelType:   uint8(t),
+		channelID:     string(ch),
+		messageID:     parts[3],
+		messageSeq:    parts[4],
+		seq:           uint32(seqNum),
+		fromUID:       string(uidBytes),
+		payloadSHA256: parts[6],
+	}, true
+}
+
+// ServerLiveDeliveryReference builds the live-ingress reference token (`l1-...`)
+// bound to a live transport frame's canonical channel, message ID, sequence,
+// sender UID, and payload SHA-256 without requiring a stored MySQL message row.
+func ServerLiveDeliveryReference(channelType uint8, channelID, messageID, messageSeq, fromUID, payloadSHA256 string) string {
+	return encodeServerLiveRef(serverRefLiveDelivery, serverLiveRef{
+		channelType:   channelType,
+		channelID:     channelID,
+		messageID:     messageID,
+		messageSeq:    messageSeq,
+		fromUID:       fromUID,
+		payloadSHA256: payloadSHA256,
+	})
+}
+
+// ServerLiveHeaderReference builds the live-ingress header token (`l2-...`)
+// corresponding to a live delivery reference.
+func ServerLiveHeaderReference(channelType uint8, channelID, messageID, messageSeq, fromUID, payloadSHA256 string) string {
+	return encodeServerLiveRef(serverRefLiveHeader, serverLiveRef{
+		channelType:   channelType,
+		channelID:     channelID,
+		messageID:     messageID,
+		messageSeq:    messageSeq,
+		fromUID:       fromUID,
+		payloadSHA256: payloadSHA256,
+	})
 }
 
 func (p *ServerMessageFactProvider) cut(started time.Time) (IMAuthorityCut, error) {
@@ -566,6 +659,270 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 	return serverResolution{delivery: d, payloadHash: payloadHash}, nil
 }
 
+func (p *ServerMessageFactProvider) userHiddenBySeq(ctx context.Context, channelType uint8, channelID, messageID string, seq uint32, uid, dmPeerUID string, hasMessageID bool) (bool, error) {
+	if hasMessageID && messageID != "" {
+		var deleted int
+		err := p.one(ctx, "SELECT COALESCE(message_is_deleted,0) FROM "+p.hooks.MessageUserExtraTable(uid)+" WHERE uid=? AND message_id=?"+p.lockSuffix(ctx), []any{uid, messageID}, &deleted)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, ErrUnavailable
+		}
+		if err == nil && deleted == 1 {
+			return true, nil
+		}
+	}
+	if seq == 0 {
+		return false, nil
+	}
+	offKey := channelID
+	if channelType == channelTypePerson {
+		offKey = dmPeerUID
+	}
+	var off sql.NullInt64
+	err := p.one(ctx, "SELECT MAX(message_seq) FROM "+p.hooks.ChannelOffsetTable(uid)+" WHERE uid=? AND channel_id=? AND channel_type=?"+p.lockSuffix(ctx), []any{uid, offKey, int(channelType)}, &off)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, ErrUnavailable
+	}
+	if off.Valid && int64(seq) <= off.Int64 {
+		return true, nil
+	}
+	var chOff sql.NullInt64
+	err = p.one(ctx, "SELECT offset_message_seq FROM channel_setting WHERE channel_id=? AND channel_type=?"+p.lockSuffix(ctx), []any{channelID, int(channelType)}, &chOff)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, ErrUnavailable
+	}
+	if chOff.Valid && chOff.Int64 > 0 && int64(seq) <= chOff.Int64 {
+		return true, nil
+	}
+	return false, nil
+}
+
+// resolveLiveOne evaluates current Bot/caller/channel/space membership and
+// access facts for a live ingress reference (l1-...) independent of whether
+// the asynchronous WukongIM-to-MySQL trigger message row has been persisted yet.
+//
+// It never pretends the server observed or authenticated message content that
+// is not in MySQL (TriggerRowPersisted=false, ContentAttestedByServer=false,
+// NativeMessageVersion="live_unpersisted_v1"). If the trigger message row has
+// already arrived in MySQL, it cross-verifies that the stored row is not
+// deleted/revoked/TTL-expired, matches from_uid/message_seq/payload_sha256,
+// and satisfies payload space_id, visibles, message_user_extra, channel_offset,
+// and channel_setting.
+func (p *ServerMessageFactProvider) resolveLiveOne(ctx context.Context, key Key, ref serverLiveRef) (serverResolution, error) {
+	un := func(reason string) (serverResolution, error) { return serverResolution{unavailable: reason}, nil }
+
+	var sourceKind, sourceID, parentGroup, dmPeerUID string
+	var parentPtr *string
+	spaceFromSource := ""
+	sourceSpaceKnown := false
+	switch ref.channelType {
+	case channelTypePerson:
+		peer, err := dmPeer(key, ref.channelID)
+		if err != nil {
+			return un("predicate_unsupported")
+		}
+		sourceKind, sourceID, dmPeerUID = "dm", ref.channelID, peer
+	case channelTypeGroup:
+		exists, status, sid, err := p.groupFacts(ctx, ref.channelID)
+		if err != nil {
+			return serverResolution{}, err
+		}
+		if !exists || (status != serverGroupStatusNormal && status != serverGroupStatusDisband) {
+			return un("expired_reference")
+		}
+		sourceKind, sourceID, spaceFromSource, sourceSpaceKnown = "group", ref.channelID, sid, true
+		parentGroup = ref.channelID
+	case channelTypeThread:
+		parts := threadID.FindStringSubmatch(ref.channelID)
+		if parts == nil {
+			return un("predicate_unsupported")
+		}
+		exists, status, sid, err := p.groupFacts(ctx, parts[1])
+		if err != nil {
+			return serverResolution{}, err
+		}
+		if !exists || (status != serverGroupStatusNormal && status != serverGroupStatusDisband) {
+			return un("parent_unavailable")
+		}
+		var tstatus int
+		e := p.one(ctx, "SELECT status FROM thread WHERE group_no=? AND short_id=?"+p.lockSuffix(ctx), []any{parts[1], parts[2]}, &tstatus)
+		if errors.Is(e, sql.ErrNoRows) || (e == nil && tstatus == serverThreadDeleted) {
+			return un("expired_reference")
+		}
+		if e != nil {
+			return serverResolution{}, ErrUnavailable
+		}
+		parentGroup = parts[1]
+		g := parts[1]
+		parentPtr = &g
+		sourceKind, sourceID, spaceFromSource, sourceSpaceKnown = "thread", ref.channelID, sid, true
+	default:
+		return un("predicate_unsupported")
+	}
+
+	var robot int
+	e := p.one(ctx, "SELECT COALESCE(robot,0) FROM user WHERE uid=?"+p.lockSuffix(ctx), []any{ref.fromUID}, &robot)
+	if errors.Is(e, sql.ErrNoRows) {
+		return un("predicate_unsupported")
+	}
+	if e != nil {
+		return serverResolution{}, ErrUnavailable
+	}
+	authorKind := "human"
+	switch {
+	case p.hooks.IsSystemUID(ref.fromUID):
+		authorKind = "system"
+	case robot != 0:
+		authorKind = "user_bot"
+	}
+
+	storedRef := serverRef{
+		kind:        serverRefDelivery,
+		channelType: ref.channelType,
+		channelID:   ref.channelID,
+		messageID:   ref.messageID,
+	}
+	var msg *serverMsgRow
+	var extra serverExtraRow
+	if ref.messageID != "" {
+		var err error
+		msg, err = p.loadMessage(ctx, storedRef)
+		if err != nil {
+			return serverResolution{}, err
+		}
+		extra, err = p.loadExtra(ctx, ref.messageID)
+		if err != nil {
+			return serverResolution{}, err
+		}
+	}
+	persisted := msg != nil
+	unPersisted := func(reason string) (serverResolution, error) {
+		return serverResolution{
+			unavailable: reason,
+			delivery: IMResolvedDelivery{
+				Status:              "unavailable",
+				Reason:              reason,
+				LiveIngress:         true,
+				Provenance:          LiveIngressProvenanceV1,
+				TriggerRowPersisted: persisted,
+			},
+		}, nil
+	}
+	if extra.exists && (extra.revoke != 0 || extra.deleted != 0) {
+		return unPersisted("expired_reference")
+	}
+	contentAttested := false
+	callerVisible := true
+	botVisible := true
+	spaceExact := true
+	headerSpaceID := key.SpaceID
+	if sourceSpaceKnown {
+		spaceExact = spaceFromSource == key.SpaceID
+		headerSpaceID = spaceFromSource
+	}
+
+	if persisted {
+		if msg.deleted != 0 || msg.isExpired(p.now()) {
+			return unPersisted("expired_reference")
+		}
+		if msg.fromUID != ref.fromUID || (ref.seq > 0 && msg.seq != ref.seq) {
+			return unPersisted("identity_mismatch")
+		}
+		body := msg.payload
+		if extra.edit.Valid {
+			body = []byte(extra.edit.String)
+		}
+		sum := sha256.Sum256(body)
+		actualHash := hex.EncodeToString(sum[:])
+		if ref.payloadSHA256 != "" && !strings.EqualFold(actualHash, ref.payloadSHA256) {
+			return unPersisted("payload_digest_mismatch")
+		}
+		contentAttested = ref.payloadSHA256 != ""
+		if !sourceSpaceKnown {
+			if tag := p.hooks.PayloadSpaceID(msg.payload); tag != "" && tag != key.SpaceID {
+				spaceExact = false
+				headerSpaceID = tag
+			}
+		}
+		callerVisible = p.hooks.PayloadVisibleTo(msg.payload, ref.fromUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, ref.fromUID))
+		botVisible = p.hooks.PayloadVisibleTo(msg.payload, key.BotUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, key.BotUID))
+	}
+
+	authorUID, botUID := ref.fromUID, key.BotUID
+	headerRef := encodeServerLiveRef(serverRefLiveHeader, ref)
+	d := IMResolvedDelivery{
+		Status:                  "resolved",
+		LiveIngress:             true,
+		Provenance:              LiveIngressProvenanceV1,
+		TriggerRowPersisted:     persisted,
+		ContentAttestedByServer: contentAttested,
+		Header: IMHeaderRecord{
+			HeaderReference:      headerRef,
+			MessageID:            ref.messageID,
+			Source:               IMHeaderSource{Kind: sourceKind, ID: sourceID},
+			ParentGroup:          parentPtr,
+			SpaceID:              headerSpaceID,
+			AuthorUID:            authorUID,
+			AuthorKind:           authorKind,
+			RecipientBotUID:      botUID,
+			NativeMessageVersion: LiveUnpersistedMessageVersionV1,
+			PayloadSHA256:        ref.payloadSHA256,
+			Delivery: IMDeliveryMetadata{
+				StreamID:          serverMessageStreamID,
+				StreamIncarnation: p.incarnation,
+				Sequence:          ref.messageSeq,
+			},
+		},
+		MessageSourceExact:  true,
+		MessageSpaceExact:   spaceExact,
+		MessageAuthorExact:  authorUID != "",
+		MessageVersionExact: true,
+	}
+
+	switch ref.channelType {
+	case channelTypePerson:
+		d.MessageRecipientExact = true
+		authorIsParticipant := authorUID == dmPeerUID || authorUID == botUID
+		authorHidden, err1 := p.userHiddenBySeq(ctx, ref.channelType, ref.channelID, ref.messageID, ref.seq, authorUID, otherOf(ref.channelID, authorUID), persisted)
+		botHidden, err2 := p.userHiddenBySeq(ctx, ref.channelType, ref.channelID, ref.messageID, ref.seq, botUID, otherOf(ref.channelID, botUID), persisted)
+		if err1 != nil || err2 != nil {
+			return serverResolution{}, ErrUnavailable
+		}
+		d.MessageAuthorExact = d.MessageAuthorExact && authorIsParticipant
+		d.CallerCurrentRead = authorIsParticipant && callerVisible && !authorHidden
+		d.BotCurrentRead = botVisible && !botHidden
+		d.CallerOriginalVisible = d.CallerCurrentRead
+		d.BotOriginalVisible = d.BotCurrentRead
+		d.BotCurrentSend = true
+	default:
+		botMember, err := p.activeMember(ctx, parentGroup, botUID)
+		if err != nil {
+			return serverResolution{}, err
+		}
+		authorMember, err := p.activeMember(ctx, parentGroup, authorUID)
+		if err != nil {
+			return serverResolution{}, err
+		}
+		authorHidden, err1 := p.userHiddenBySeq(ctx, ref.channelType, ref.channelID, ref.messageID, ref.seq, authorUID, "", persisted)
+		botHidden, err2 := p.userHiddenBySeq(ctx, ref.channelType, ref.channelID, ref.messageID, ref.seq, botUID, "", persisted)
+		if err1 != nil || err2 != nil {
+			return serverResolution{}, ErrUnavailable
+		}
+		d.MessageRecipientExact = botMember
+		d.CallerCurrentRead = authorMember && callerVisible && !authorHidden
+		d.BotCurrentRead = botMember && botVisible && !botHidden
+		d.CallerParentCurrentRead = authorMember
+		d.BotParentCurrentRead = botMember
+		d.CallerOriginalVisible = d.CallerCurrentRead
+		d.BotOriginalVisible = d.BotCurrentRead
+		_, st, _, gerr := p.groupFacts(ctx, parentGroup)
+		if gerr != nil {
+			return serverResolution{}, gerr
+		}
+		d.BotCurrentSend = botMember && st == serverGroupStatusNormal
+	}
+	return serverResolution{delivery: d, payloadHash: ref.payloadSHA256}, nil
+}
+
 func otherOf(fakeChannelID, uid string) string {
 	p := strings.Split(fakeChannelID, "@")
 	if len(p) != 2 {
@@ -587,6 +944,23 @@ func (p *ServerMessageFactProvider) InspectDeliveredHeadersV1(ctx context.Contex
 	started := p.now().UTC().Truncate(time.Microsecond)
 	out := make([]IMResolvedDelivery, 0, len(deliveryRefs))
 	for _, ref := range deliveryRefs {
+		if liveRef, ok := decodeServerLiveRef(serverRefLiveDelivery, ref); ok {
+			res, err := p.resolveLiveOne(ctx, key, liveRef)
+			if err != nil {
+				return nil, IMAuthorityCut{}, err
+			}
+			if res.unavailable != "" {
+				out = append(out, IMResolvedDelivery{Reference: ref, Status: "unavailable", Reason: res.unavailable})
+				continue
+			}
+			if purpose == "contributor" && !res.delivery.TriggerRowPersisted {
+				out = append(out, IMResolvedDelivery{Reference: ref, Status: "unavailable", Reason: "mirror_lag"})
+				continue
+			}
+			res.delivery.Reference = ref
+			out = append(out, res.delivery)
+			continue
+		}
 		r, ok := decodeServerRef(serverRefDelivery, ref)
 		if !ok {
 			out = append(out, IMResolvedDelivery{Reference: ref, Status: "unavailable", Reason: "predicate_unsupported"})
@@ -860,6 +1234,9 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 	if p == nil || !key.Valid() {
 		return DeliveryBindingResultV1{}, IMAuthorityCut{}, ErrUnavailable
 	}
+	if req.Operation == "bind_live_ingress" {
+		return p.bindLiveIngressV1(ctx, key, req)
+	}
 	started := p.now().UTC().Truncate(time.Microsecond)
 	ref := serverRef{
 		kind:        serverRefDelivery,
@@ -977,12 +1354,172 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 	}, cut, nil
 }
 
+func (p *ServerMessageFactProvider) bindLiveIngressV1(ctx context.Context, key Key, req DeliveryBindingRequestV1) (DeliveryBindingResultV1, IMAuthorityCut, error) {
+	started := p.now().UTC().Truncate(time.Microsecond)
+	seqNum, err := U64(req.MessageSeq)
+	if err != nil || seqNum == 0 || seqNum > 4294967295 {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, ErrInvalid
+	}
+	liveRef := serverLiveRef{
+		kind:          serverRefLiveDelivery,
+		channelType:   req.ChannelType,
+		channelID:     req.ChannelID,
+		messageID:     req.MessageID,
+		messageSeq:    req.MessageSeq,
+		seq:           uint32(seqNum),
+		fromUID:       req.FromUID,
+		payloadSHA256: strings.ToLower(req.ObservedPayloadSHA256),
+	}
+	if req.ChannelType == channelTypePerson && !strings.Contains(req.ChannelID, "@") {
+		if pair, err := PairReference(key.BotUID, req.ChannelID); err == nil {
+			liveRef.channelID = pair["id"].(string)
+		}
+	}
+	res, err := p.resolveLiveOne(ctx, key, liveRef)
+	if err != nil {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, err
+	}
+	cut, err := p.cut(started)
+	if err != nil {
+		return DeliveryBindingResultV1{}, IMAuthorityCut{}, err
+	}
+	if res.unavailable != "" {
+		return DeliveryBindingResultV1{
+			Status:                  "refused",
+			Reason:                  res.unavailable,
+			Current:                 false,
+			Provenance:              LiveIngressProvenanceV1,
+			TriggerRowPersisted:     res.delivery.TriggerRowPersisted,
+			ContentAttestedByServer: res.delivery.ContentAttestedByServer,
+		}, cut, nil
+	}
+	d := res.delivery
+	if req.ExpectedNativeVersion != "" && req.ExpectedNativeVersion != d.Header.NativeMessageVersion {
+		return DeliveryBindingResultV1{
+			Status:                  "refused",
+			Reason:                  "version_mismatch",
+			Current:                 false,
+			Provenance:              LiveIngressProvenanceV1,
+			TriggerRowPersisted:     d.TriggerRowPersisted,
+			ContentAttestedByServer: d.ContentAttestedByServer,
+			NativeMessageVersion:    d.Header.NativeMessageVersion,
+		}, cut, nil
+	}
+	if !d.MessageSpaceExact || !d.BotCurrentRead || !d.CallerCurrentRead || !d.MessageRecipientExact || !d.MessageAuthorExact {
+		return DeliveryBindingResultV1{
+			Status:                  "refused",
+			Reason:                  "visibility_denied",
+			Current:                 false,
+			Provenance:              LiveIngressProvenanceV1,
+			TriggerRowPersisted:     d.TriggerRowPersisted,
+			ContentAttestedByServer: d.ContentAttestedByServer,
+			NativeMessageVersion:    d.Header.NativeMessageVersion,
+		}, cut, nil
+	}
+
+	proven := map[string]bool{
+		"message_source_exact":    d.MessageSourceExact,
+		"message_space_exact":     d.MessageSpaceExact,
+		"message_author_exact":    d.MessageAuthorExact,
+		"message_recipient_exact": d.MessageRecipientExact,
+		"message_version_exact":   d.MessageVersionExact,
+		"caller_current_read":     d.CallerCurrentRead,
+		"bot_current_read":        d.BotCurrentRead,
+		"caller_original_visible": d.CallerOriginalVisible,
+		"bot_original_visible":    d.BotOriginalVisible,
+		"bot_current_send":        d.BotCurrentSend,
+	}
+	if req.ChannelType != channelTypePerson {
+		proven["caller_parent_current_read"] = d.CallerParentCurrentRead
+		proven["bot_parent_current_read"] = d.BotParentCurrentRead
+	}
+	purposes := []string{"admit", "reply"}
+	if d.TriggerRowPersisted && d.ContentAttestedByServer {
+		purposes = []string{"admit", "contributor", "reply"}
+	}
+	deliveryRef := encodeServerLiveRef(serverRefLiveDelivery, liveRef)
+	return DeliveryBindingResultV1{
+		Status:                  "bound",
+		Current:                 true,
+		Provenance:              LiveIngressProvenanceV1,
+		TriggerRowPersisted:     d.TriggerRowPersisted,
+		ContentAttestedByServer: d.ContentAttestedByServer,
+		DeliveryReference:       deliveryRef,
+		HeaderReference:         d.Header.HeaderReference,
+		NativeMessageVersion:    d.Header.NativeMessageVersion,
+		ObservedPayloadSHA256:   liveRef.payloadSHA256,
+		Header:                  d.Header,
+		ProvenPredicates:        proven,
+		UnknownPredicates:       []string{},
+		ResolvablePurposes:      purposes,
+	}, cut, nil
+}
+
 // ServerSourceReference builds the history source token for one channel.
 func ServerSourceReference(channelType uint8, channelID string) string {
 	return strings.TrimSuffix(encodeServerRef(serverRefSource, serverRef{channelType: channelType, channelID: channelID, messageID: "0"}), "-0")
 }
 
+// EvaluateCurrentAccessV1 evaluates current channel/space/visibility facts and
+// optional persisted-row integrity for operation: "evaluate_current_access"
+// without requiring a stored trigger message row in MySQL.
+func (p *ServerMessageFactProvider) EvaluateCurrentAccessV1(ctx context.Context, key Key, req CurrentAccessRequestV1) (CurrentAccessEvaluationV1, IMAuthorityCut, error) {
+	if p == nil || !key.Valid() || (req.Purpose != "admit" && req.Purpose != "reply") {
+		return CurrentAccessEvaluationV1{}, IMAuthorityCut{}, ErrUnavailable
+	}
+	started := p.now().UTC().Truncate(time.Microsecond)
+	channelID := req.ChannelID
+	if req.ChannelType == channelTypePerson && !strings.Contains(req.ChannelID, "@") {
+		if pair, err := PairReference(key.BotUID, req.ChannelID); err == nil {
+			channelID = pair["id"].(string)
+		}
+	}
+	var seq uint32
+	if req.MessageSeq != "" {
+		if seqNum, err := U64(req.MessageSeq); err == nil && seqNum > 0 && seqNum <= 4294967295 {
+			seq = uint32(seqNum)
+		}
+	}
+	liveRef := serverLiveRef{
+		kind:          serverRefLiveDelivery,
+		channelType:   req.ChannelType,
+		channelID:     channelID,
+		messageID:     req.MessageID,
+		messageSeq:    req.MessageSeq,
+		seq:           seq,
+		fromUID:       req.CallerUID,
+		payloadSHA256: strings.ToLower(req.ObservedPayloadSHA256),
+	}
+	res, err := p.resolveLiveOne(ctx, key, liveRef)
+	if err != nil {
+		return CurrentAccessEvaluationV1{}, IMAuthorityCut{}, err
+	}
+	cut, err := p.cut(started)
+	if err != nil {
+		return CurrentAccessEvaluationV1{}, IMAuthorityCut{}, err
+	}
+	if res.unavailable != "" {
+		return CurrentAccessEvaluationV1{
+			Status:                  "unavailable",
+			Reason:                  res.unavailable,
+			TriggerRowPersisted:     res.delivery.TriggerRowPersisted,
+			ContentAttestedByServer: res.delivery.ContentAttestedByServer,
+		}, cut, nil
+	}
+	d := res.delivery
+	return CurrentAccessEvaluationV1{
+		Status:                  "evaluated",
+		TriggerRowPersisted:     d.TriggerRowPersisted,
+		ContentAttestedByServer: d.ContentAttestedByServer,
+		Source:                  d.Header.Source,
+		ParentGroup:             d.Header.ParentGroup,
+		AuthorKind:              d.Header.AuthorKind,
+		Delivery:                d,
+	}, cut, nil
+}
+
 var (
 	_ NativeIMFactProvider          = (*ServerMessageFactProvider)(nil)
 	_ NativeDeliveryReferenceBinder = (*ServerMessageFactProvider)(nil)
+	_ NativeCurrentAccessEvaluator  = (*ServerMessageFactProvider)(nil)
 )

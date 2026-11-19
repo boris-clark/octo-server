@@ -133,6 +133,7 @@ type FencedAuthorityAdapter struct {
 	mu        sync.RWMutex
 	recovered bool
 	fence     RecoveryFenceV1
+	txGate    chan struct{}
 }
 
 func NewFencedAuthorityAdapter(ctx context.Context, driver ExternalAuthorityDriver, expectedCatalogDigest string) (*FencedAuthorityAdapter, error) {
@@ -142,11 +143,27 @@ func NewFencedAuthorityAdapter(ctx context.Context, driver ExternalAuthorityDriv
 	adapter := &FencedAuthorityAdapter{
 		driver:                driver,
 		expectedCatalogDigest: expectedCatalogDigest,
+		txGate:                make(chan struct{}, 1),
 	}
 	if _, err := adapter.RecoverAtLeast(ctx); err != nil {
 		return nil, err
 	}
 	return adapter, nil
+}
+
+func (a *FencedAuthorityAdapter) acquireTxGate(ctx context.Context) (func(), error) {
+	if a == nil || a.txGate == nil {
+		return func() {}, nil
+	}
+	select {
+	case a.txGate <- struct{}{}:
+		var once sync.Once
+		return func() {
+			once.Do(func() { <-a.txGate })
+		}, nil
+	case <-ctx.Done():
+		return nil, ErrUnavailable
+	}
 }
 
 func (a *FencedAuthorityAdapter) RecoverAtLeast(ctx context.Context) (RecoveryFenceV1, error) {
@@ -592,7 +609,11 @@ func (d *NativeSingleWriterLineageDriver) readSQLRow(ctx context.Context, runner
 }, forUpdate bool) (nativeAuthoritySQLRow, bool, error) {
 	var r nativeAuthoritySQLRow
 	var gen, committed, acked, checkpoint int64
-	q := `SELECT authority_id,incarnation,catalog_digest,election_generation,active_writer_id,committed_position,acknowledged_position,recoverable_scope_checkpoint,state_hmac FROM ` + NativeAuthorityLineageTable + ` WHERE singleton=1` + d.lockSuffix(forUpdate)
+	suffix := ""
+	if forUpdate {
+		suffix = d.lockSuffix(true)
+	}
+	q := `SELECT authority_id,incarnation,catalog_digest,election_generation,active_writer_id,committed_position,acknowledged_position,recoverable_scope_checkpoint,state_hmac FROM ` + NativeAuthorityLineageTable + ` WHERE singleton=1` + suffix
 	qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	err := runner.QueryRowContext(qCtx, q).Scan(

@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "handoff_version": "v13",
+  "contract_version": "v2_async_ingress_separation",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "task_key": "XIN-2793",
+  "workspace_id": "620b900b-0dea-443e-b0da-9948b6aa6dcf",
+  "owner_authorization": {
+    "implement_authority": "2123331688342654976",
+    "prior_decisions_retained": [
+      "2123326487372140544",
+      "2123331461770547200",
+      "2123303920984821760",
+      "2123302644242878464"
+    ],
+    "trigger_comment_id": "8f1a6726-2b61-4b21-8ea9-5a2606b185b5",
+    "continuation_comment_id": "9fe15972-80e5-437b-adac-02831cdcf99d",
+    "early_server_contract_comment_id": "265d3a6c-902a-4710-a60f-d50e95f97f69"
+  },
+  "repository": {
+    "upstream": "https://github.com/Mininglamp-OSS/octo-server.git",
+    "fork": "https://github.com/boris-clark/octo-server.git",
+    "draft_pr": "https://github.com/Mininglamp-OSS/octo-server/pull/951",
+    "head_branch": "feat/xin-2793-permission-server",
+    "target_branch": "chore/mcp-integration-20261103",
+    "target_base_sha": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+    "parent_commit": "ab056abd74c3b61d7f86a238a16b3966f84cb723",
+    "grandparent_commit": "d1cda266944af459fd92db3602f3a054fd31c0c7",
+    "great_grandparent_commit": "53b0dcc6d176a56746d9da3ab64a65c21c434348",
+    "parent_handoff_file": "pkg/permissionbundle/contracts/handoff-v12.json",
+    "parent_handoff_sha256": "a7bb6c393d9904eed558b8863d53ace32b101752129b180b2b30d0003406d089"
+  },
+  "consumed_sibling_pins": {
+    "octo_cli": {
+      "task_key": "XIN-2794",
+      "task_id": "229ad215-8526-4a04-8f5b-36f073f81a16",
+      "pr": "https://github.com/Mininglamp-OSS/octo-cli/pull/15",
+      "baseline_head_sha": "424942e82934a105ed011830d5a482cb0682bd49"
+    },
+    "codex_channel_octo": {
+      "task_key": "XIN-2795",
+      "task_id": "2f4a34e9-2be3-48ac-99f0-38a30f077acd",
+      "pr": "https://github.com/Mininglamp-OSS/codex-channel-octo/pull/21",
+      "delivered_head_sha": "fa7896a845aaab16fdda926b4b406dfa47a3a3e4",
+      "delivered_tree_sha": "c394c5a84d586a98b05cb73e2248e635354b5807",
+      "handoff_file": "docs/permission-endpoint-handoff-v8.json",
+      "handoff_sha256": "dcabcc17e2d4c86f6801845d7f932870a1a176ff3fd8b3c0a42ddf45b16c8e7e",
+      "attachment_id": "01a1f306-ecbc-7822-ba6a-fc11e57e5dd7"
+    }
+  },
+  "asynchronous_ingress_separation_architecture": {
+    "core_principle": "Preserve existing WukongIM-to-MySQL asynchronous webhook synchronization unchanged (no synchronous send-time trigger-row insert, no WukongIM changes, and no retry-budget-only substitute). Separate (1) current live ingress admission, tool revalidation, and ordinary reply authorization from (2) stored message/resource operations (actual history reads, explicit quote/reply-to message lookup, historical contributors, and stored message edits/deletes).",
+    "live_ingress_current_facts_surface": {
+      "bind_live_ingress": {
+        "route": "POST /v1/bot/permission-facts/v1/bind-delivery?space_id=<space_id>",
+        "operation": "bind_live_ingress",
+        "behavior": "Evaluates live current principal, space, DM friend/blacklist, group/thread membership, status, join-time/clear-history channel_offset, and channel_setting cutoffs under the caller's RepeatableRead SQL transaction and FencedAuthority cut without requiring the trigger message row in MySQL. Canonicalizes bare-peer DM channel_id via PairReference(key.BotUID, req.ChannelID). Mints l1-... delivery_reference and l2-... header_reference with native_message_version='live_unpersisted_v1', provenance='live_channel_acl_v1', trigger_row_persisted=bool, and content_attested_by_server=bool.",
+        "unpersisted_honesty_invariant": "When the trigger message row is not yet present in MySQL message{N}, trigger_row_persisted=false, content_attested_by_server=false, and resolvable_purposes=['admit','reply']. Server never claims to have attested stored message body bytes it has not observed in storage.",
+        "persisted_cross_check_invariant": "If the trigger message row is already present in MySQL (or arrives asynchronously mid-turn), Server cross-checks message.is_deleted, expire TTL, message_extra.revoke/is_deleted/content_edit, from_uid, message_seq, payload SHA-256, payload space_id tag, payload visibles whitelist, and message_user_extra per-user deletion, failing closed on any conflict (expired_reference, identity_mismatch, payload_digest_mismatch, visibility_denied) while keeping header_reference='l2-...' and native_message_version='live_unpersisted_v1' invariant across mid-turn rechecks."
+      },
+      "resolve_with_l1_token": {
+        "route": "POST /v1/bot/permission-facts/v1?space_id=<space_id>",
+        "operation": "resolve",
+        "behavior": "Accepts l1-... live delivery references for purpose='admit' and purpose='reply' and evaluates the exact 10 predicate profiles in shared-contract-v6.json without requiring the trigger message row in MySQL. Refuses purpose='contributor' on unpersisted l1-... tokens with status='unavailable', reason='mirror_lag'."
+      },
+      "evaluate_current_access": {
+        "route": "POST /v1/bot/permission-facts/v1?space_id=<space_id>",
+        "operation": "evaluate_current_access",
+        "behavior": "Stateless current-ACL evaluation for purpose='admit' or 'reply' returning status='evaluated'|'unavailable', eligible=bool, profile, provenance='live_channel_acl_v1', trigger_row_persisted=bool, content_attested_by_server=bool, native_message_version, source, parent_group, caller_uid, author_kind, authority_refs, and predicates."
+      }
+    },
+    "stored_message_operations_remain_strict": {
+      "bind_delivery": "Continues to require a persisted MySQL message{N} row and returns status='refused', reason='mirror_lag' when the row is absent.",
+      "s1_h1_c1_references": "All s1-... delivery references, h1-... header references, c1-... history source references, history_headers, and history_disclosure continue to require persisted MySQL message rows.",
+      "history_disclosure_rejects_live_tokens": "Passing an l2-... (or l1-...) live token to history_disclosure returns status='unavailable', reason='predicate_unsupported' and never issues a history disclosure permit without a stored MySQL message row."
+    },
+    "single_writer_concurrency_serialization": {
+      "fix": "FencedAuthorityAdapter serializes active scopeTx transactions via a context-aware transaction gate acquired in Store.begin before session.BeginTx and released in scopeTx.close after complete() / RollbackUnlessCommitted(), and NativeSingleWriterLineageDriver.readSQLRow only appends FOR UPDATE NOWAIT when forUpdate=true (RecoverAtLeast), preventing MVCC snapshot vs hostState position inversion and InnoDB singleton=1 lock contention across concurrent requests."
+    }
+  },
+  "verification": {
+    "commands": [
+      "go test -mod=readonly -v -count=1 -run 'TestServerMessageFacts' ./pkg/permissionbundle",
+      "go test -mod=readonly -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -race -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -v -count=1 -run 'TestInstallPermissionBundle' .",
+      "go test -mod=readonly -v -count=1 -run 'TestServerMessageFactHooksUseModuleHelpers' ./modules/message",
+      "go test -mod=readonly -v -count=1 -run 'TestBotPermissionOptInRouteComposition' ./modules/bot_api",
+      "OCTO_TEST_MYSQL_DSN='root:testpass@tcp(127.0.0.1:13309)/octotest?parseTime=true&multiStatements=true' go test -v -race ./pkg/permissionbundle/... -run TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding",
+      "go vet -mod=readonly ./pkg/permissionbundle . ./modules/message ./modules/bot_api",
+      "go build -o /tmp/octo-server-xin2793-build-check ."
+    ]
+  }
+}

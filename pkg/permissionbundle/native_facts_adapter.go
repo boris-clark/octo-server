@@ -127,6 +127,12 @@ type IMResolvedDelivery struct {
 	MessageVersionUnknown        bool
 	CallerOriginalVisibleUnknown bool
 	BotOriginalVisibleUnknown    bool
+
+	// Live ingress provenance metadata (when resolved via l1-... live-ingress reference).
+	LiveIngress             bool
+	Provenance              string
+	TriggerRowPersisted     bool
+	ContentAttestedByServer bool
 }
 
 // unknownReason reports whether an unproven value applies to the purpose.
@@ -183,6 +189,7 @@ type NativeIMFactProvider interface {
 // the delivered version: the caller must supply the observed sender, sequence,
 // and payload SHA-256 digest from the ingress frame.
 type DeliveryBindingRequestV1 struct {
+	Operation             string
 	RequestID             string
 	ChannelType           uint8
 	ChannelID             string
@@ -194,20 +201,23 @@ type DeliveryBindingRequestV1 struct {
 }
 
 // DeliveryBindingResultV1 is the metadata-only outcome of binding a delivered
-// message frame against server storage. No message, quote, or media body is
-// ever included.
+// message frame against server storage (bind_delivery) or live channel ACL
+// facts (bind_live_ingress). No message, quote, or media body is ever included.
 type DeliveryBindingResultV1 struct {
-	Status                string
-	Reason                string
-	Current               bool
-	DeliveryReference     string
-	HeaderReference       string
-	NativeMessageVersion  string
-	ObservedPayloadSHA256 string
-	Header                IMHeaderRecord
-	ProvenPredicates      map[string]bool
-	UnknownPredicates     []string
-	ResolvablePurposes    []string
+	Status                  string
+	Reason                  string
+	Current                 bool
+	Provenance              string
+	TriggerRowPersisted     bool
+	ContentAttestedByServer bool
+	DeliveryReference       string
+	HeaderReference         string
+	NativeMessageVersion    string
+	ObservedPayloadSHA256   string
+	Header                  IMHeaderRecord
+	ProvenPredicates        map[string]bool
+	UnknownPredicates       []string
+	ResolvablePurposes      []string
 }
 
 // NativeDeliveryReferenceBinder is implemented by NativeIMFactProvider
@@ -216,6 +226,39 @@ type DeliveryBindingResultV1 struct {
 // s1-.../h1-... reference without releasing body bytes.
 type NativeDeliveryReferenceBinder interface {
 	BindDeliveredMessageV1(ctx context.Context, key Key, req DeliveryBindingRequestV1) (DeliveryBindingResultV1, IMAuthorityCut, error)
+}
+
+// CurrentAccessRequestV1 carries the parameters for operation: "evaluate_current_access".
+type CurrentAccessRequestV1 struct {
+	RequestID             string
+	Purpose               string
+	ChannelType           uint8
+	ChannelID             string
+	CallerUID             string
+	MessageID             string
+	MessageSeq            string
+	ObservedPayloadSHA256 string
+}
+
+// CurrentAccessEvaluationV1 is the provider-level outcome of evaluating live
+// channel/message visibility and optional persisted-row integrity without
+// requiring a stored trigger message row.
+type CurrentAccessEvaluationV1 struct {
+	Status                  string
+	Reason                  string
+	TriggerRowPersisted     bool
+	ContentAttestedByServer bool
+	Source                  IMHeaderSource
+	ParentGroup             *string
+	AuthorKind              string
+	Delivery                IMResolvedDelivery
+}
+
+// NativeCurrentAccessEvaluator is implemented by NativeIMFactProvider
+// implementations (such as ServerMessageFactProvider) that support stateless
+// live current-access evaluation independent of the trigger message row.
+type NativeCurrentAccessEvaluator interface {
+	EvaluateCurrentAccessV1(ctx context.Context, key Key, req CurrentAccessRequestV1) (CurrentAccessEvaluationV1, IMAuthorityCut, error)
 }
 
 // DeliveredMessageBinder is the optional NativeFactSource extension for
@@ -378,6 +421,8 @@ func (a *SQLNativeFactAdapter) Read(ctx context.Context, tx *dbr.Tx, key Key, re
 		return a.readHistoryHeaders(ctx, tx, key, keyObj, req, readID, sqlID, authRead.Incarnation(), sqlPos, sqlNonce, sqlStarted)
 	case "history_disclosure":
 		return a.readHistoryDisclosure(ctx, tx, key, keyObj, req, readID, sqlID, authRead.Incarnation(), sqlPos, sqlNonce, sqlStarted)
+	case "evaluate_current_access":
+		return a.readEvaluateCurrentAccess(ctx, tx, key, keyObj, req, readID, sqlID, authRead.Incarnation(), sqlPos, sqlNonce, sqlStarted)
 	default:
 		return nil, ErrInvalid
 	}
@@ -448,6 +493,11 @@ func (a *SQLNativeFactAdapter) BindDeliveredMessage(ctx context.Context, tx *dbr
 		if res.NativeMessageVersion != "" {
 			binding["native_message_version"] = res.NativeMessageVersion
 		}
+		if parsedReq.Operation == "bind_live_ingress" {
+			binding["provenance"] = LiveIngressProvenanceV1
+			binding["trigger_row_persisted"] = res.TriggerRowPersisted
+			binding["content_attested_by_server"] = res.ContentAttestedByServer
+		}
 	case "bound":
 		if !res.Current || res.DeliveryReference == "" || res.HeaderReference == "" || res.NativeMessageVersion == "" || !validHex(res.ObservedPayloadSHA256, 64) {
 			return nil, ErrUnavailable
@@ -476,6 +526,11 @@ func (a *SQLNativeFactAdapter) BindDeliveredMessage(ctx context.Context, tx *dbr
 			"unknown_predicates":      unknowns,
 			"resolvable_purposes":     purposes,
 			"authority_refs":          authorityRefs,
+		}
+		if parsedReq.Operation == "bind_live_ingress" {
+			binding["provenance"] = LiveIngressProvenanceV1
+			binding["trigger_row_persisted"] = res.TriggerRowPersisted
+			binding["content_attested_by_server"] = res.ContentAttestedByServer
 		}
 	default:
 		return nil, ErrUnavailable
@@ -961,6 +1016,256 @@ func (a *SQLNativeFactAdapter) readResolve(ctx context.Context, tx *dbr.Tx, key 
 		"observed_at":     observedAt,
 		"authorities":     authorities,
 		"results":         results,
+	}
+	return canonical(resp), nil
+}
+
+func (a *SQLNativeFactAdapter) readEvaluateCurrentAccess(ctx context.Context, tx *dbr.Tx, key Key, keyObj map[string]any, req map[string]any, readID, sqlID, sqlIncarnation, sqlPos, sqlNonce string, sqlStarted time.Time) ([]byte, error) {
+	evaluator, ok := a.IMProvider.(NativeCurrentAccessEvaluator)
+	if !ok {
+		return nil, ErrUnavailable
+	}
+	purpose, _ := req["purpose"].(string)
+	chTypeNum, _ := req["channel_type"].(json.Number)
+	chTypeU64, err := U64(string(chTypeNum))
+	if err != nil {
+		return nil, ErrInvalid
+	}
+	channelID, _ := req["channel_id"].(string)
+	callerUID, _ := req["caller_uid"].(string)
+	msgID, _ := req["message_id"].(string)
+	msgSeq, _ := req["message_seq"].(string)
+	payloadSHA, _ := req["observed_payload_sha256"].(string)
+
+	eval, imCut, err := evaluator.EvaluateCurrentAccessV1(ctx, key, CurrentAccessRequestV1{
+		RequestID:             req["request_id"].(string),
+		Purpose:               purpose,
+		ChannelType:           uint8(chTypeU64),
+		ChannelID:             channelID,
+		CallerUID:             callerUID,
+		MessageID:             msgID,
+		MessageSeq:            msgSeq,
+		ObservedPayloadSHA256: payloadSHA,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !validHex(imCut.Incarnation, 32) || !validHex(imCut.ReadNonce, 32) || imCut.ReadNonce == sqlNonce {
+		return nil, ErrUnavailable
+	}
+	base, err := a.evalScopeBaseFacts(ctx, tx, key)
+	if err != nil {
+		return nil, err
+	}
+	authorityRefs := []any{imCut.ReadNonce, sqlNonce}
+	var accessObj map[string]any
+	if eval.Status == "unavailable" {
+		accessObj = map[string]any{
+			"status":                     "unavailable",
+			"reason":                     eval.Reason,
+			"provenance":                 LiveIngressProvenanceV1,
+			"trigger_row_persisted":      eval.TriggerRowPersisted,
+			"content_attested_by_server": eval.ContentAttestedByServer,
+			"authority_refs":             authorityRefs,
+		}
+	} else if eval.Status != "evaluated" {
+		return nil, ErrUnavailable
+	} else {
+		d := eval.Delivery
+		srcExists, spaceExact, threadNotDel, err := a.evalSourceExists(ctx, tx, key, eval.Source)
+		if err != nil {
+			return nil, err
+		}
+		author, err := a.evalAuthorFacts(ctx, tx, key.SpaceID, callerUID)
+		if err != nil {
+			return nil, err
+		}
+		sourceObj := map[string]any{
+			"kind": eval.Source.Kind,
+			"id":   eval.Source.ID,
+		}
+		var parentGroupVal any
+		if eval.ParentGroup != nil {
+			parentGroupVal = *eval.ParentGroup
+		}
+		if eval.AuthorKind != "human" {
+			preds := map[string]any{
+				"identity_supported":      false,
+				"author_is_human":         false,
+				"message_source_exact":    d.MessageSourceExact,
+				"message_space_exact":     d.MessageSpaceExact,
+				"message_author_exact":    d.MessageAuthorExact,
+				"message_recipient_exact": d.MessageRecipientExact,
+				"message_version_exact":   d.MessageVersionExact,
+				"source_exists":           srcExists,
+			}
+			accessObj = map[string]any{
+				"status":                     "evaluated",
+				"eligible":                   false,
+				"profile":                    "unsupported_principal_v1",
+				"provenance":                 LiveIngressProvenanceV1,
+				"trigger_row_persisted":      eval.TriggerRowPersisted,
+				"content_attested_by_server": eval.ContentAttestedByServer,
+				"native_message_version":     d.Header.NativeMessageVersion,
+				"source":                     sourceObj,
+				"parent_group":               parentGroupVal,
+				"caller_uid":                 callerUID,
+				"author_kind":                eval.AuthorKind,
+				"authority_refs":             authorityRefs,
+				"predicates":                 preds,
+			}
+		} else {
+			profile := eval.Source.Kind + "_" + purpose + "_v1"
+			preds := map[string]any{
+				"identity_supported":      author.identitySupported,
+				"author_is_human":         author.authorIsHuman,
+				"author_active":           author.authorActive,
+				"author_not_destroyed":    author.authorNotDestroyed,
+				"bot_user_active":         base.botUserActive,
+				"bot_robot_active":        base.botRobotActive,
+				"bot_creator_eligible":    base.botCreatorEligible,
+				"space_active":            base.spaceActive,
+				"caller_space_member":     author.callerSpaceMember,
+				"bot_space_member":        base.botSpaceMember,
+				"message_source_exact":    d.MessageSourceExact,
+				"message_space_exact":     d.MessageSpaceExact,
+				"message_author_exact":    d.MessageAuthorExact,
+				"message_recipient_exact": d.MessageRecipientExact,
+				"message_version_exact":   d.MessageVersionExact,
+				"source_exists":           srcExists,
+			}
+			switch eval.Source.Kind {
+			case "dm":
+				peer, dmErr := dmPeer(key, eval.Source.ID)
+				dmPeerExact := dmErr == nil && peer == callerUID
+				isCreator := base.creatorUID != "" && base.creatorUID == callerUID
+				h2b, h2bNotAlone, err := a.evalFriendDirected(ctx, tx, callerUID, key.BotUID)
+				if err != nil {
+					return nil, err
+				}
+				b2h, b2hNotAlone, err := a.evalFriendDirected(ctx, tx, key.BotUID, callerUID)
+				if err != nil {
+					return nil, err
+				}
+				humanBlocksClear, err := a.evalBlacklistClear(ctx, tx, callerUID, key.BotUID)
+				if err != nil {
+					return nil, err
+				}
+				botBlocksClear, err := a.evalBlacklistClear(ctx, tx, key.BotUID, callerUID)
+				if err != nil {
+					return nil, err
+				}
+				preds["dm_peer_exact"] = dmPeerExact
+				preds["dm_human_blocks_bot_clear"] = humanBlocksClear
+				preds["dm_bot_blocks_human_clear"] = botBlocksClear
+				if purpose == "reply" {
+					preds["dm_bot_to_human_send_relation"] = isCreator || (h2b && h2bNotAlone && b2h && b2hNotAlone)
+					preds["bot_current_send"] = d.BotCurrentSend
+				} else {
+					preds["dm_human_to_bot_relation"] = isCreator || h2b
+					preds["dm_bot_to_human_read_relation"] = isCreator || b2h
+					preds["caller_current_read"] = d.CallerCurrentRead
+					preds["bot_current_read"] = d.BotCurrentRead
+					preds["caller_original_visible"] = d.CallerOriginalVisible
+					preds["bot_original_visible"] = d.BotOriginalVisible
+				}
+			case "group":
+				callerMember, callerInternal, err := a.evalGroupMember(ctx, tx, eval.Source.ID, callerUID)
+				if err != nil {
+					return nil, err
+				}
+				botMember, botInternal, err := a.evalGroupMember(ctx, tx, eval.Source.ID, key.BotUID)
+				if err != nil {
+					return nil, err
+				}
+				preds["group_space_exact"] = spaceExact
+				preds["bot_group_active_member"] = botMember
+				preds["bot_external_access"] = botMember && (botInternal || base.botSpaceMember)
+				if purpose == "reply" {
+					preds["bot_current_send"] = d.BotCurrentSend
+				} else {
+					preds["caller_group_active_member"] = callerMember
+					preds["caller_external_access"] = callerMember && (callerInternal || author.callerSpaceMember)
+					preds["caller_current_read"] = d.CallerCurrentRead
+					preds["bot_current_read"] = d.BotCurrentRead
+					preds["caller_original_visible"] = d.CallerOriginalVisible
+					preds["bot_original_visible"] = d.BotOriginalVisible
+				}
+			case "thread":
+				parts := threadID.FindStringSubmatch(eval.Source.ID)
+				parentGroup := ""
+				if parts != nil {
+					parentGroup = parts[1]
+				}
+				parentVerified := parts != nil && eval.ParentGroup != nil && *eval.ParentGroup == parentGroup
+				callerParent, callerInternal, err := a.evalGroupMember(ctx, tx, parentGroup, callerUID)
+				if err != nil {
+					return nil, err
+				}
+				botParent, botInternal, err := a.evalGroupMember(ctx, tx, parentGroup, key.BotUID)
+				if err != nil {
+					return nil, err
+				}
+				preds["parent_verified"] = parentVerified
+				preds["thread_not_deleted"] = threadNotDel
+				preds["parent_space_exact"] = spaceExact
+				preds["bot_parent_active_member"] = botParent
+				preds["bot_external_access"] = botParent && (botInternal || base.botSpaceMember)
+				if purpose == "reply" {
+					preds["bot_current_send"] = d.BotCurrentSend
+				} else {
+					preds["caller_parent_active_member"] = callerParent
+					preds["caller_parent_current_read"] = d.CallerParentCurrentRead
+					preds["bot_parent_current_read"] = d.BotParentCurrentRead
+					preds["caller_current_read"] = d.CallerCurrentRead
+					preds["bot_current_read"] = d.BotCurrentRead
+					preds["caller_original_visible"] = d.CallerOriginalVisible
+					preds["bot_original_visible"] = d.BotOriginalVisible
+					preds["caller_external_access"] = callerParent && (callerInternal || author.callerSpaceMember)
+				}
+			default:
+				return nil, ErrUnavailable
+			}
+			eligible := true
+			for _, pv := range preds {
+				b, ok := pv.(bool)
+				if !ok || !b {
+					eligible = false
+					break
+				}
+			}
+			accessObj = map[string]any{
+				"status":                     "evaluated",
+				"eligible":                   eligible,
+				"profile":                    profile,
+				"provenance":                 LiveIngressProvenanceV1,
+				"trigger_row_persisted":      eval.TriggerRowPersisted,
+				"content_attested_by_server": eval.ContentAttestedByServer,
+				"native_message_version":     d.Header.NativeMessageVersion,
+				"source":                     sourceObj,
+				"parent_group":               parentGroupVal,
+				"caller_uid":                 callerUID,
+				"author_kind":                eval.AuthorKind,
+				"authority_refs":             authorityRefs,
+				"predicates":                 preds,
+			}
+		}
+	}
+
+	sqlCompleted := time.Now().UTC().Truncate(time.Microsecond)
+	sqlAuth := formatAuthorityDescriptor(sqlID, "sql", sqlIncarnation, sqlPos, sqlNonce, sqlStarted, sqlCompleted)
+	imAuth := formatAuthorityDescriptor(imCut.AuthorityID, "im", imCut.Incarnation, imCut.Position, imCut.ReadNonce, imCut.StartedAt, imCut.CompletedAt)
+	authorities, observedAt := sortAuthoritiesAndObserved(sqlAuth, imAuth, sqlCompleted, imCut.CompletedAt)
+
+	resp := map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"key":             keyObj,
+		"request_id":      req["request_id"],
+		"read_id":         readID,
+		"observed_at":     observedAt,
+		"authorities":     authorities,
+		"access":          accessObj,
 	}
 	return canonical(resp), nil
 }
