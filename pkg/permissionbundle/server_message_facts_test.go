@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"github.com/Mininglamp-OSS/octo-lib/config"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
 	"github.com/stretchr/testify/require"
@@ -216,23 +218,29 @@ func TestServerMessageFactsGroupAndThreadUnknownOriginalVisibility(t *testing.T)
 	g := f.resolve("admit", ServerDeliveryReference(2, "group", "4001", "x0_0"))[0]
 	require.Equal(t, "resolved", g.Status)
 	require.True(t, g.MessageSpaceExact && g.MessageRecipientExact && g.BotCurrentRead && g.CallerCurrentRead && g.BotCurrentSend)
-	// No membership history exists in octo-server: original visibility is unknown, not true.
-	require.False(t, g.CallerOriginalVisible)
-	require.False(t, g.BotOriginalVisible)
-	require.True(t, g.CallerOriginalVisibleUnknown && g.BotOriginalVisibleUnknown)
-	require.Equal(t, "predicate_unsupported", g.unknownReason("admit"))
-	require.Equal(t, "", g.unknownReason("reply"), "reply does not consult original visibility")
+	// Under octo-server's native current group ACL (joining grants full group history
+	// subject to current membership, visibles, per-user delete, and offsets), current
+	// group read visibility proves original visibility without a send-time witness.
+	require.True(t, g.CallerOriginalVisible)
+	require.True(t, g.BotOriginalVisible)
+	require.False(t, g.CallerOriginalVisibleUnknown || g.BotOriginalVisibleUnknown)
+	require.Equal(t, "", g.unknownReason("admit"))
+	require.Equal(t, "", g.unknownReason("contributor"))
+	require.Equal(t, "", g.unknownReason("reply"))
 
 	th := f.resolve("contributor", ServerDeliveryReference(5, f.threadCh, "4002", "x0_0"))[0]
 	require.Equal(t, "thread", th.Header.Source.Kind)
 	require.NotNil(t, th.Header.ParentGroup)
 	require.Equal(t, f.parent, *th.Header.ParentGroup)
-	require.True(t, th.CallerParentCurrentRead && th.BotParentCurrentRead && th.BotOriginalVisibleUnknown)
+	require.True(t, th.CallerParentCurrentRead && th.BotParentCurrentRead && th.CallerOriginalVisible && th.BotOriginalVisible)
+	require.False(t, th.CallerOriginalVisibleUnknown || th.BotOriginalVisibleUnknown)
 
-	// Departed author: current read is false (choice-B intent: departure is not repaired by history).
+	// Departed author: current and original read are false (departure revokes caller read).
 	dep := f.resolve("admit", ServerDeliveryReference(2, "group", "4003", "x0_0"))[0]
 	require.False(t, dep.CallerCurrentRead)
+	require.False(t, dep.CallerOriginalVisible)
 	require.True(t, dep.BotCurrentRead)
+	require.True(t, dep.BotOriginalVisible)
 
 	// Deleted thread and disbanded/disabled groups are non-serving.
 	f.exec("UPDATE thread SET status=3")
@@ -288,15 +296,23 @@ func TestServerMessageFactsHistoryAndTwoStepDisclosure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "unavailable", gone[0].Status)
 
-	// Group history cannot be disclosed: original visibility is unknown.
+	// Group history is disclosed when current native group ACL allows both caller and bot read,
+	// and refused once current group ACL is lost (e.g., channel_offset history cutoff or removal).
 	f.msg("5100", 1, "peer", "group", 2, map[string]any{"type": 1})
 	gp, err := f.p.ListHistoryHeadersV1(t.Context(), fixtureKey, ServerSourceReference(2, "group"), nil, 2)
 	require.NoError(t, err)
 	require.Equal(t, "resolved", gp.Items[0].Status)
 	gd, _, err := f.p.IssueHistoryDisclosureV1(t.Context(), fixtureKey, "ctx1", "epoch1", []string{gp.Items[0].Header.HeaderReference})
 	require.NoError(t, err)
-	require.Equal(t, "unavailable", gd[0].Status)
-	require.Equal(t, "disclosure_unavailable", gd[0].Reason)
+	require.Equal(t, "resolved", gd[0].Status)
+	require.NotEmpty(t, gd[0].Permit)
+	require.NoError(t, f.p.ConsumeDisclosurePermit(fixtureKey, "ctx1", "epoch1", gp.Items[0].Header.HeaderReference, gp.Items[0].Header.PayloadSHA256, gd[0].Permit))
+
+	f.exec("INSERT INTO channel_offset VALUES('bot','group',2,1)")
+	gdHidden, _, err := f.p.IssueHistoryDisclosureV1(t.Context(), fixtureKey, "ctx2", "epoch1", []string{gp.Items[0].Header.HeaderReference})
+	require.NoError(t, err)
+	require.Equal(t, "unavailable", gdHidden[0].Status)
+	require.Equal(t, "disclosure_unavailable", gdHidden[0].Reason)
 }
 
 func TestServerMessageFactsConfigAndModeGuards(t *testing.T) {
@@ -349,7 +365,8 @@ func TestServerMessageFactsThroughSQLNativeFactAdapter(t *testing.T) {
 		purpose string
 		want    []string // status per ref
 	}{
-		{"admit", []string{"resolved", "unavailable", "unavailable", "unavailable", "unavailable"}},
+		{"admit", []string{"resolved", "unavailable", "resolved", "unavailable", "unavailable"}},
+		{"contributor", []string{"resolved", "unavailable", "resolved", "unavailable", "unavailable"}},
 		{"reply", []string{"resolved", "unavailable", "resolved", "unavailable", "unavailable"}},
 	} {
 		list := make([]any, len(refs))
@@ -372,7 +389,14 @@ func TestServerMessageFactsThroughSQLNativeFactAdapter(t *testing.T) {
 			preds := results[0].(map[string]any)["predicates"].(map[string]any)
 			require.Equal(t, true, preds["message_version_exact"])
 			require.Equal(t, true, preds["bot_original_visible"])
-			require.Equal(t, "predicate_unsupported", results[2].(map[string]any)["reason"])
+			grpPreds := results[2].(map[string]any)["predicates"].(map[string]any)
+			require.Equal(t, true, grpPreds["caller_group_active_member"])
+			require.Equal(t, true, grpPreds["bot_group_active_member"])
+			require.Equal(t, true, grpPreds["caller_current_read"])
+			require.Equal(t, true, grpPreds["bot_current_read"])
+			require.Equal(t, true, grpPreds["caller_original_visible"])
+			require.Equal(t, true, grpPreds["bot_original_visible"])
+			require.Equal(t, "predicate_unsupported", results[1].(map[string]any)["reason"])
 			require.Equal(t, "mirror_lag", results[4].(map[string]any)["reason"])
 		}
 	}
@@ -459,6 +483,13 @@ func TestServerMessageFactsNativeGroupBindingRefusals(t *testing.T) {
 		{name: "wrong space", mutation: "UPDATE `group` SET space_id='other-space'", reason: "visibility_denied"},
 		{name: "removed bot", mutation: "UPDATE group_member SET is_deleted=1 WHERE uid='bot'", reason: "visibility_denied"},
 		{name: "blocked bot", mutation: "UPDATE group_member SET status=0 WHERE uid='bot'", reason: "visibility_denied"},
+		{name: "removed caller", mutation: "UPDATE group_member SET is_deleted=1 WHERE uid='peer'", reason: "visibility_denied"},
+		{name: "blocked caller", mutation: "UPDATE group_member SET status=0 WHERE uid='peer'", reason: "visibility_denied"},
+		{name: "bot clear history offset", mutation: "INSERT INTO channel_offset VALUES('bot','group',2,3)", reason: "visibility_denied"},
+		{name: "caller clear history offset", mutation: "INSERT INTO channel_offset VALUES('peer','group',2,3)", reason: "visibility_denied"},
+		{name: "channel setting offset", mutation: "INSERT INTO channel_setting VALUES('group',2,3)", reason: "visibility_denied"},
+		{name: "bot user extra deleted", mutation: "INSERT INTO message_user_extra VALUES('bot','2123243248167063552',1)", reason: "visibility_denied"},
+		{name: "caller user extra deleted", mutation: "INSERT INTO message_user_extra VALUES('peer','2123243248167063552',1)", reason: "visibility_denied"},
 		{name: "revoked", mutation: "INSERT INTO message_extra VALUES('2123243248167063552',1,1,0,NULL,'')", reason: "expired_reference"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -478,8 +509,10 @@ func TestServerMessageFactsNativeGroupBindingRefusals(t *testing.T) {
 				return
 			}
 			require.Equal(t, "bound", got.Status)
-			require.Equal(t, []string{"reply"}, got.ResolvablePurposes)
-			require.Equal(t, []string{"bot_original_visible", "caller_original_visible"}, got.UnknownPredicates)
+			require.Equal(t, []string{"admit", "contributor", "reply"}, got.ResolvablePurposes)
+			require.Empty(t, got.UnknownPredicates)
+			require.Equal(t, true, got.ProvenPredicates["caller_original_visible"])
+			require.Equal(t, true, got.ProvenPredicates["bot_original_visible"])
 			require.NotContains(t, string(canonical(got.Header.toMap())), "NATIVE-GROUP-SECRET")
 		})
 	}
@@ -570,8 +603,8 @@ func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testin
 	require.Empty(t, bDM["unknown_predicates"].([]any))
 	require.Equal(t, []any{"admit", "contributor", "reply"}, bDM["resolvable_purposes"].([]any))
 
-	// 2. Positive path: Group and Thread bind for reply, while explicitly listing
-	// caller_original_visible and bot_original_visible in unknown_predicates (never fabricated true).
+	// 2. Positive path: Group and Thread bind for admit, contributor, and reply under
+	// native current group/thread ACL with zero unknown_predicates.
 	bGroup := callBind(map[string]any{
 		"schema_version":          json.Number("1"),
 		"operation":               "bind_delivery",
@@ -584,11 +617,11 @@ func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testin
 		"observed_payload_sha256": groupDigest,
 	})
 	require.Equal(t, "bound", bGroup["status"])
-	require.Equal(t, []any{"bot_original_visible", "caller_original_visible"}, bGroup["unknown_predicates"].([]any))
-	require.Equal(t, []any{"reply"}, bGroup["resolvable_purposes"].([]any))
+	require.Empty(t, bGroup["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, bGroup["resolvable_purposes"].([]any))
 	grpProven := bGroup["proven_predicates"].(map[string]any)
-	require.NotContains(t, grpProven, "caller_original_visible")
-	require.NotContains(t, grpProven, "bot_original_visible")
+	require.Equal(t, true, grpProven["caller_original_visible"])
+	require.Equal(t, true, grpProven["bot_original_visible"])
 
 	bThread := callBind(map[string]any{
 		"schema_version":          json.Number("1"),
@@ -602,8 +635,11 @@ func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testin
 		"observed_payload_sha256": threadDigest,
 	})
 	require.Equal(t, "bound", bThread["status"])
-	require.Equal(t, []any{"bot_original_visible", "caller_original_visible"}, bThread["unknown_predicates"].([]any))
-	require.Equal(t, []any{"reply"}, bThread["resolvable_purposes"].([]any))
+	require.Empty(t, bThread["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, bThread["resolvable_purposes"].([]any))
+	thdProven := bThread["proven_predicates"].(map[string]any)
+	require.Equal(t, true, thdProven["caller_original_visible"])
+	require.Equal(t, true, thdProven["bot_original_visible"])
 
 	// 3. Untagged DM binds reference metadata but marks message_space_exact as unknown (non-serving for resolve).
 	bUntagged := callBind(map[string]any{
@@ -1255,4 +1291,488 @@ func TestServerMessageFactsRound2CrossSpaceHistoryAndDisclosureScopeAndEpochGuar
 	err = f.s.Session.QueryRow("SELECT COUNT(*) FROM "+ServerDisclosurePermitTable+" WHERE header_reference=?", hdrRef9505).Scan(&permitCountFor9505)
 	require.NoError(t, err)
 	require.Equal(t, 0, permitCountFor9505)
+}
+
+func TestServerMessageFactsNativeCurrentACLGroupAndThreadAdmissionAndPreJoinHistory(t *testing.T) {
+	ctx := t.Context()
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f := newServerFacts(t)
+	f.s.Authority = authority
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	// Provision scope so Runtime.Facts(history_disclosure) validates context_epoch="0".
+	_, err = f.s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	adapter, err := NewSQLNativeFactAdapter(authority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	// 1. Receive-before-persistence timing (mirror_lag) boundary:
+	// Before the message row is persisted by webhook notify, BindDeliveredMessage
+	// fails closed with mirror_lag and never infers authority from a transport frame.
+	preJoinPayload := map[string]any{"type": 1, "content": "PRE-JOIN-GROUP-SECRET-1"}
+	preJoinDigest := sha256OfJSON(preJoinPayload)
+	postCutoffPayload := map[string]any{"type": 1, "content": "POST-CUTOFF-GROUP-SECRET-2"}
+	postCutoffDigest := sha256OfJSON(postCutoffPayload)
+	threadPayload := map[string]any{"type": 1, "content": "CURRENT-THREAD-SECRET-1"}
+	threadDigest := sha256OfJSON(threadPayload)
+
+	callBind := func(reqID string, ctype int, ch, msgID, seq, from, digest string) map[string]any {
+		out, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":          json.Number("1"),
+			"operation":               "bind_delivery",
+			"request_id":              reqID,
+			"channel_type":            json.Number(strconv.Itoa(ctype)),
+			"channel_id":              ch,
+			"message_id":              msgID,
+			"message_seq":             seq,
+			"from_uid":                from,
+			"observed_payload_sha256": digest,
+		})))
+		require.NoError(t, err)
+		for _, secret := range []string{"PRE-JOIN-GROUP-SECRET-1", "POST-CUTOFF-GROUP-SECRET-2", "CURRENT-THREAD-SECRET-1", "EDITED-VISIBLES-SECRET"} {
+			require.NotContains(t, string(out), secret)
+		}
+		return fixtureObject(t, out)["binding"].(map[string]any)
+	}
+
+	unpersisted := callBind("req-pre-persist-1", 2, "group", "2123284828068417536", "1", "peer", preJoinDigest)
+	require.Equal(t, "refused", unpersisted["status"])
+	require.Equal(t, "mirror_lag", unpersisted["reason"])
+	require.Equal(t, false, unpersisted["current"])
+
+	// 2. Persist messages sent before/after Bot joined (Owner product semantics:
+	// joining a group grants full history access under native current ACL without
+	// any send-time or first-persist membership witness table).
+	f.msgWithExpire("2123284828068417536", 1, "peer", "group", 2, 1700000001, 0, preJoinPayload)
+	f.msgWithExpire("2123284828068417537", 2, "peer", "group", 2, 1700000002, 0, postCutoffPayload)
+	f.msgWithExpire("2123284828068417538", 1, "peer", f.threadCh, 5, 1700000003, 0, threadPayload)
+
+	boundPreJoin := callBind("req-bound-prejoin-1", 2, "group", "2123284828068417536", "1", "peer", preJoinDigest)
+	require.Equal(t, "bound", boundPreJoin["status"])
+	require.Equal(t, true, boundPreJoin["current"])
+	require.Empty(t, boundPreJoin["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, boundPreJoin["resolvable_purposes"].([]any))
+	preJoinProven := boundPreJoin["proven_predicates"].(map[string]any)
+	require.Equal(t, true, preJoinProven["caller_current_read"])
+	require.Equal(t, true, preJoinProven["bot_current_read"])
+	require.Equal(t, true, preJoinProven["caller_original_visible"])
+	require.Equal(t, true, preJoinProven["bot_original_visible"])
+	delivRef1 := boundPreJoin["delivery_reference"].(string)
+	hdrRef1 := boundPreJoin["header_reference"].(string)
+
+	boundPostCutoff := callBind("req-bound-postcutoff-2", 2, "group", "2123284828068417537", "2", "peer", postCutoffDigest)
+	require.Equal(t, "bound", boundPostCutoff["status"])
+	delivRef2 := boundPostCutoff["delivery_reference"].(string)
+	hdrRef2 := boundPostCutoff["header_reference"].(string)
+
+	boundThread := callBind("req-bound-thread-1", 5, f.threadCh, "2123284828068417538", "1", "peer", threadDigest)
+	require.Equal(t, "bound", boundThread["status"])
+	require.Empty(t, boundThread["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, boundThread["resolvable_purposes"].([]any))
+	delivRefThread := boundThread["delivery_reference"].(string)
+	hdrRefThread := boundThread["header_reference"].(string)
+
+	// 3. Resolve for admit, contributor, and reply succeeds for both group and thread messages.
+	for _, purpose := range []string{"admit", "contributor", "reply"} {
+		resOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      hex.EncodeToString([]byte("grp-res-" + purpose + "----------------")[:16]),
+			"operation":       "resolve",
+			"purpose":         purpose,
+			"references": []any{
+				map[string]any{"delivery_reference": delivRef1},
+				map[string]any{"delivery_reference": delivRef2},
+				map[string]any{"delivery_reference": delivRefThread},
+			},
+		})))
+		require.NoError(t, err, purpose)
+		results := fixtureObject(t, resOut)["results"].([]any)
+		require.Len(t, results, 3)
+		for idx, raw := range results {
+			item := raw.(map[string]any)
+			require.Equal(t, "resolved", item["status"], "%s idx %d", purpose, idx)
+			preds := item["predicates"].(map[string]any)
+			for k, v := range preds {
+				require.Equal(t, true, v, "%s idx %d pred %s", purpose, idx, k)
+			}
+		}
+	}
+
+	// 4. Two-step history_headers + history_disclosure succeeds for pre-join group and thread messages.
+	hhGroupOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":   json.Number("1"),
+		"profile_version":  json.Number("1"),
+		"request_id":       strings.Repeat("a", 32),
+		"operation":        "history_headers",
+		"source_reference": ServerSourceReference(2, "group"),
+		"cursor":           nil,
+		"page_size":        json.Number("10"),
+	})))
+	require.NoError(t, err)
+	hhGroupItems := fixtureObject(t, hhGroupOut)["page"].(map[string]any)["items"].([]any)
+	require.Len(t, hhGroupItems, 2)
+	require.Equal(t, "2123284828068417537", hhGroupItems[0].(map[string]any)["message_id"])
+	require.Equal(t, "2123284828068417536", hhGroupItems[1].(map[string]any)["message_id"])
+
+	hdOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("b", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("1", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef1},
+			map[string]any{"header_reference": hdrRefThread},
+		},
+	})))
+	require.NoError(t, err)
+	hdResults := fixtureObject(t, hdOut)["results"].([]any)
+	require.Len(t, hdResults, 2)
+	require.Equal(t, "resolved", hdResults[0].(map[string]any)["status"])
+	permit1 := hdResults[0].(map[string]any)["permit"].(string)
+	require.NotEmpty(t, permit1)
+	require.Equal(t, "resolved", hdResults[1].(map[string]any)["status"])
+	permitThread := hdResults[1].(map[string]any)["permit"].(string)
+	require.NotEmpty(t, permitThread)
+	require.NoError(t, f.p.ConsumeDisclosurePermitContext(ctx, fixtureKey, strings.Repeat("1", 32), "0", hdrRef1, preJoinDigest, permit1))
+	require.ErrorIs(t, f.p.ConsumeDisclosurePermitContext(ctx, fixtureKey, strings.Repeat("1", 32), "0", hdrRef1, preJoinDigest, permit1), ErrReference)
+
+	// 5. Join-time history cutoff (allow_view_history_msg=0 -> channel_offset.message_seq = 1 for bot):
+	// Message seq=1 (at/before offset) is now refused by bind_delivery, resolve, history_headers, and history_disclosure,
+	// while message seq=2 (after offset) remains accessible!
+	f.exec("INSERT INTO channel_offset VALUES('bot','group',2,1)")
+
+	cutBind1 := callBind("req-cutoff-bind-1", 2, "group", "2123284828068417536", "1", "peer", preJoinDigest)
+	require.Equal(t, "refused", cutBind1["status"])
+	require.Equal(t, "visibility_denied", cutBind1["reason"])
+
+	cutBind2 := callBind("req-cutoff-bind-2", 2, "group", "2123284828068417537", "2", "peer", postCutoffDigest)
+	require.Equal(t, "bound", cutBind2["status"])
+
+	resCutOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("c", 32),
+		"operation":       "resolve",
+		"purpose":         "admit",
+		"references": []any{
+			map[string]any{"delivery_reference": delivRef1},
+			map[string]any{"delivery_reference": delivRef2},
+		},
+	})))
+	require.NoError(t, err)
+	resCutItems := fixtureObject(t, resCutOut)["results"].([]any)
+	predsCut1 := resCutItems[0].(map[string]any)["predicates"].(map[string]any)
+	require.Equal(t, false, predsCut1["bot_current_read"])
+	require.Equal(t, false, predsCut1["bot_original_visible"])
+	predsCut2 := resCutItems[1].(map[string]any)["predicates"].(map[string]any)
+	require.Equal(t, true, predsCut2["bot_current_read"])
+	require.Equal(t, true, predsCut2["bot_original_visible"])
+
+	hhCutPage, err := f.p.ListHistoryHeadersV1(ctx, fixtureKey, ServerSourceReference(2, "group"), nil, 10)
+	require.NoError(t, err)
+	require.Len(t, hhCutPage.Items, 2)
+	require.Equal(t, "resolved", hhCutPage.Items[0].Status, "seq 2 > channel_offset 1 remains visible")
+	require.Equal(t, "unavailable", hhCutPage.Items[1].Status, "seq 1 <= channel_offset 1 is hidden")
+	require.Equal(t, "expired_reference", hhCutPage.Items[1].Reason)
+
+	hdCutOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("d", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("2", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": hdrRef1},
+			map[string]any{"header_reference": hdrRef2},
+		},
+	})))
+	require.NoError(t, err)
+	hdCutRes := fixtureObject(t, hdCutOut)["results"].([]any)
+	require.Equal(t, "unavailable", hdCutRes[0].(map[string]any)["status"])
+	require.Equal(t, "disclosure_unavailable", hdCutRes[0].(map[string]any)["reason"])
+	require.Equal(t, "resolved", hdCutRes[1].(map[string]any)["status"])
+	require.NotEmpty(t, hdCutRes[1].(map[string]any)["permit"])
+
+	// 6. Edited payload visibles exclusion and caller departure/removal also refuse disclosure and binding.
+	editedVisibles := `{"content":"EDITED-VISIBLES-SECRET","type":1,"visibles":["peer"]}`
+	editedVisSum := sha256.Sum256([]byte(editedVisibles))
+	editedVisDigest := hex.EncodeToString(editedVisSum[:])
+	f.exec("INSERT INTO message_extra VALUES('2123284828068417537',3,0,0,?,'v33')", editedVisibles)
+
+	visBind := callBind("req-vis-bind-2", 2, "group", "2123284828068417537", "2", "peer", editedVisDigest)
+	require.Equal(t, "refused", visBind["status"])
+	require.Equal(t, "visibility_denied", visBind["reason"])
+
+	hdrRef2Edited := encodeServerRef(serverRefHeader, serverRef{channelType: 2, channelID: "group", messageID: "2123284828068417537", version: "x3_v33"})
+	visDisc, _, err := f.p.IssueHistoryDisclosureV1(ctx, fixtureKey, "ctx-vis", "0", []string{hdrRef2Edited})
+	require.NoError(t, err)
+	require.Equal(t, "unavailable", visDisc[0].Status)
+	require.Equal(t, "disclosure_unavailable", visDisc[0].Reason)
+
+	// Caller removal in parent group revokes thread binding and disclosure as well.
+	f.exec("UPDATE group_member SET is_deleted=1 WHERE group_no=? AND uid='peer'", f.parent)
+	thdRemovedCallerBind := callBind("req-thd-removed-caller", 5, f.threadCh, "2123284828068417538", "1", "peer", threadDigest)
+	require.Equal(t, "refused", thdRemovedCallerBind["status"])
+	require.Equal(t, "visibility_denied", thdRemovedCallerBind["reason"])
+
+	thdRemovedCallerDisc, _, err := f.p.IssueHistoryDisclosureV1(ctx, fixtureKey, "ctx-thd-rem", "0", []string{hdrRefThread})
+	require.NoError(t, err)
+	require.Equal(t, "unavailable", thdRemovedCallerDisc[0].Status)
+	require.Equal(t, "disclosure_unavailable", thdRemovedCallerDisc[0].Reason)
+}
+
+func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("OCTO_TEST_MYSQL_DSN"))
+	if dsn == "" {
+		t.Skip("OCTO_TEST_MYSQL_DSN not set; skipping live MySQL 8 integration check")
+	}
+	ctx := t.Context()
+	conn, err := dbr.Open("mysql", dsn, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	for i := 0; i < 30; i++ {
+		if err = conn.Ping(); err == nil {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	require.NoError(t, err)
+	sess := conn.NewSession(nil)
+
+	for _, ddl := range []string{
+		"DROP TABLE IF EXISTS bot_permission_disclosure_permit, bot_permission_lineage, bot_permission_replay_journal, bot_permission_bundle_history, bot_permission_bundle_current, bot_permission_scope, channel_setting, channel_offset, message_user_extra, message_extra, message, thread, group_member, `group`, user_setting, friend, space_member, space, app_bot, robot, user",
+		"CREATE TABLE user(id BIGINT PRIMARY KEY AUTO_INCREMENT, uid VARCHAR(128) NOT NULL UNIQUE, status INT NOT NULL, is_destroy INT NOT NULL DEFAULT 0, robot INT NOT NULL DEFAULT 0) ENGINE=InnoDB",
+		"CREATE TABLE robot(id BIGINT PRIMARY KEY AUTO_INCREMENT, robot_id VARCHAR(128) NOT NULL UNIQUE, creator_uid VARCHAR(128) NOT NULL, status INT NOT NULL) ENGINE=InnoDB",
+		"CREATE TABLE app_bot(id BIGINT PRIMARY KEY AUTO_INCREMENT, uid VARCHAR(128) NOT NULL UNIQUE, status INT NOT NULL DEFAULT 0) ENGINE=InnoDB",
+		"CREATE TABLE space(id BIGINT PRIMARY KEY AUTO_INCREMENT, space_id VARCHAR(128) NOT NULL UNIQUE, status INT NOT NULL) ENGINE=InnoDB",
+		"CREATE TABLE space_member(space_id VARCHAR(128) NOT NULL, uid VARCHAR(128) NOT NULL, status INT NOT NULL, PRIMARY KEY(space_id, uid)) ENGINE=InnoDB",
+		"CREATE TABLE friend(uid VARCHAR(128) NOT NULL, to_uid VARCHAR(128) NOT NULL, is_deleted INT NOT NULL DEFAULT 0, is_alone INT NOT NULL DEFAULT 0, PRIMARY KEY(uid, to_uid)) ENGINE=InnoDB",
+		"CREATE TABLE user_setting(uid VARCHAR(128) NOT NULL, to_uid VARCHAR(128) NOT NULL, blacklist INT NOT NULL DEFAULT 0, PRIMARY KEY(uid, to_uid)) ENGINE=InnoDB",
+		"CREATE TABLE `group`(group_no VARCHAR(128) NOT NULL PRIMARY KEY, space_id VARCHAR(128) NOT NULL, status INT NOT NULL) ENGINE=InnoDB",
+		"CREATE TABLE group_member(group_no VARCHAR(128) NOT NULL, uid VARCHAR(128) NOT NULL, status INT NOT NULL DEFAULT 1, is_deleted INT NOT NULL DEFAULT 0, is_external INT NOT NULL DEFAULT 0, PRIMARY KEY(group_no, uid)) ENGINE=InnoDB",
+		"CREATE TABLE thread(group_no VARCHAR(128) NOT NULL, short_id VARCHAR(64) NOT NULL, status INT NOT NULL, PRIMARY KEY(group_no, short_id)) ENGINE=InnoDB",
+		"CREATE TABLE message(message_id VARCHAR(64) NOT NULL PRIMARY KEY, message_seq BIGINT NOT NULL, from_uid VARCHAR(128) NOT NULL, channel_id VARCHAR(191) NOT NULL, channel_type INT NOT NULL, `timestamp` BIGINT NOT NULL, payload LONGBLOB NOT NULL, is_deleted INT NOT NULL DEFAULT 0, expire BIGINT NOT NULL DEFAULT 0) ENGINE=InnoDB",
+		"CREATE TABLE message_extra(message_id VARCHAR(64) NOT NULL PRIMARY KEY, version INT NOT NULL DEFAULT 0, `revoke` INT NOT NULL DEFAULT 0, is_deleted INT NOT NULL DEFAULT 0, content_edit LONGTEXT NULL, content_edit_hash VARCHAR(128) NOT NULL DEFAULT '') ENGINE=InnoDB",
+		"CREATE TABLE message_user_extra(uid VARCHAR(128) NOT NULL, message_id VARCHAR(64) NOT NULL, message_is_deleted INT NOT NULL DEFAULT 0, PRIMARY KEY(uid, message_id)) ENGINE=InnoDB",
+		"CREATE TABLE channel_offset(uid VARCHAR(128) NOT NULL, channel_id VARCHAR(191) NOT NULL, channel_type INT NOT NULL, message_seq BIGINT NOT NULL, PRIMARY KEY(uid, channel_id, channel_type)) ENGINE=InnoDB",
+		"CREATE TABLE channel_setting(channel_id VARCHAR(191) NOT NULL, channel_type INT NOT NULL, offset_message_seq BIGINT NOT NULL, PRIMARY KEY(channel_id, channel_type)) ENGINE=InnoDB",
+		"CREATE TABLE bot_permission_scope(bot_uid VARBINARY(128) NOT NULL, space_id VARBINARY(128) NOT NULL, scope_incarnation VARBINARY(128) NOT NULL UNIQUE, revision VARCHAR(64) NOT NULL, context_epoch VARCHAR(64) NOT NULL, schema_version INT NOT NULL, catalog_version VARCHAR(64) NOT NULL, catalog_digest VARBINARY(128) NOT NULL, bundle_json LONGTEXT NOT NULL, bundle_digest VARBINARY(128) NOT NULL, native_anchor_json LONGTEXT NOT NULL, native_anchor_digest VARBINARY(128) NOT NULL, retired INT NOT NULL DEFAULT 0, updated_by VARCHAR(128) NULL, updated_at DATETIME(6) NOT NULL, PRIMARY KEY(bot_uid, space_id)) ENGINE=InnoDB",
+		ServerDisclosurePermitDDL,
+	} {
+		_, err := sess.Exec(ddl)
+		require.NoError(t, err, ddl)
+	}
+
+	parent := strings.Repeat("1", 32)
+	threadCh := parent + "____123456789012345"
+	pair, err := PairReference("bot", "peer")
+	require.NoError(t, err)
+	dmChan := pair["id"].(string)
+
+	for _, seedQ := range []string{
+		"INSERT INTO user(uid,status,is_destroy,robot) VALUES('bot',1,0,1),('owner',1,0,0),('peer',1,0,0),('departed',1,0,0)",
+		"INSERT INTO robot(robot_id,creator_uid,status) VALUES('bot','owner',1)",
+		"INSERT INTO space(space_id,status) VALUES('space',1)",
+		"INSERT INTO space_member(space_id,uid,status) VALUES('space','bot',1),('space','owner',1),('space','peer',1),('space','departed',0)",
+		"INSERT INTO friend(uid,to_uid,is_deleted,is_alone) VALUES('peer','bot',0,0),('bot','peer',0,0)",
+		"INSERT INTO `group`(group_no,space_id,status) VALUES('group','space',1),('" + parent + "','space',1)",
+		"INSERT INTO group_member(group_no,uid,status,is_deleted,is_external) VALUES('group','bot',1,0,0),('group','peer',1,0,0),('group','departed',1,1,0),('" + parent + "','bot',1,0,0),('" + parent + "','peer',1,0,0)",
+		"INSERT INTO thread(group_no,short_id,status) VALUES('" + parent + "','123456789012345',1)",
+	} {
+		_, err := sess.Exec(seedQ)
+		require.NoError(t, err, seedQ)
+	}
+
+	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
+	authority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	s := Store{
+		Session:   sess,
+		Origin:    fixtureKey.Origin,
+		Authority: authority,
+		Native:    SQLNative{},
+		Releases:  fixtureReleases{},
+	}
+	txAssoc, err := sess.Begin()
+	require.NoError(t, err)
+	defer txAssoc.RollbackUnlessCommitted()
+	anchor, err := s.Native.Scope(ctx, txAssoc, fixtureKey, "owner", strings.Repeat("a", 32))
+	require.NoError(t, err)
+	require.NoError(t, s.ProvisionSuffix(ctx, txAssoc, fixtureKey, anchor, fixturePin))
+	require.NoError(t, txAssoc.Commit())
+	_, err = s.Get(ctx, fixtureKey, "owner")
+	require.NoError(t, err)
+
+	p, err := NewServerMessageFactProvider(ServerMessageFactConfig{
+		Session:             sess,
+		Hooks:               testServerHooks(),
+		StoreIncarnation:    strings.Repeat("5", 32),
+		PermitKey:           []byte(strings.Repeat("k", 32)),
+		DurablePermitLedger: true,
+	})
+	require.NoError(t, err)
+	adapter, err := NewSQLNativeFactAdapter(authority, p)
+	require.NoError(t, err)
+	// Keep adapter.testNoLocks == false so real MySQL 8 FOR SHARE NOWAIT / FOR SHARE execute!
+	c := &config.Context{}
+	require.NoError(t, Install(c, s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	dmPayload := map[string]any{"type": 1, "space_id": "space", "content": "MYSQL-LIVE-DM-SECRET"}
+	dmBytes, _ := json.Marshal(dmPayload)
+	dmDigest := sha256OfJSON(dmPayload)
+	_, err = sess.Exec("INSERT INTO message VALUES('2123243234824982528',4,'peer',?,1,1700000001,?,0,0)", dmChan, dmBytes)
+	require.NoError(t, err)
+
+	grpPayload := map[string]any{"type": 1, "content": "MYSQL-LIVE-GROUP-PREJOIN-SECRET"}
+	grpBytes, _ := json.Marshal(grpPayload)
+	grpDigest := sha256OfJSON(grpPayload)
+	_, err = sess.Exec("INSERT INTO message VALUES('2123284828068417536',1,'peer','group',2,1700000002,?,0,0)", grpBytes)
+	require.NoError(t, err)
+
+	thdPayload := map[string]any{"type": 1, "content": "MYSQL-LIVE-THREAD-SECRET"}
+	thdBytes, _ := json.Marshal(thdPayload)
+	thdDigest := sha256OfJSON(thdPayload)
+	_, err = sess.Exec("INSERT INTO message VALUES('2123284828068417538',1,'peer',?,5,1700000003,?,0,0)", threadCh, thdBytes)
+	require.NoError(t, err)
+
+	// 1. Bare-peer DM bind_delivery on real MySQL 8 with FOR SHARE NOWAIT and quoted `revoke`.
+	dmBindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-dm-bind-1",
+		"channel_type":            json.Number("1"),
+		"channel_id":              "peer",
+		"message_id":              "2123243234824982528",
+		"message_seq":             "4",
+		"from_uid":                "peer",
+		"observed_payload_sha256": dmDigest,
+	})))
+	require.NoError(t, err)
+	dmBinding := fixtureObject(t, dmBindOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", dmBinding["status"])
+	require.Equal(t, []any{"admit", "contributor", "reply"}, dmBinding["resolvable_purposes"].([]any))
+
+	// 2. Group and thread bind_delivery, resolve(admit|contributor|reply), and history_disclosure on real MySQL 8.
+	grpBindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-grp-bind-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "2123284828068417536",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": grpDigest,
+	})))
+	require.NoError(t, err)
+	grpBinding := fixtureObject(t, grpBindOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", grpBinding["status"])
+	require.Empty(t, grpBinding["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, grpBinding["resolvable_purposes"].([]any))
+	grpDelivRef := grpBinding["delivery_reference"].(string)
+	grpHdrRef := grpBinding["header_reference"].(string)
+
+	thdBindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-thd-bind-1",
+		"channel_type":            json.Number("5"),
+		"channel_id":              threadCh,
+		"message_id":              "2123284828068417538",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": thdDigest,
+	})))
+	require.NoError(t, err)
+	thdBinding := fixtureObject(t, thdBindOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", thdBinding["status"])
+	require.Empty(t, thdBinding["unknown_predicates"].([]any))
+	require.Equal(t, []any{"admit", "contributor", "reply"}, thdBinding["resolvable_purposes"].([]any))
+	thdDelivRef := thdBinding["delivery_reference"].(string)
+	thdHdrRef := thdBinding["header_reference"].(string)
+
+	resOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("9", 32),
+		"operation":       "resolve",
+		"purpose":         "admit",
+		"references": []any{
+			map[string]any{"delivery_reference": grpDelivRef},
+			map[string]any{"delivery_reference": thdDelivRef},
+		},
+	})))
+	require.NoError(t, err)
+	resItems := fixtureObject(t, resOut)["results"].([]any)
+	require.Equal(t, "resolved", resItems[0].(map[string]any)["status"])
+	require.Equal(t, "resolved", resItems[1].(map[string]any)["status"])
+
+	hdOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("8", 32),
+		"operation":       "history_disclosure",
+		"context_id":      strings.Repeat("7", 32),
+		"context_epoch":   "0",
+		"headers": []any{
+			map[string]any{"header_reference": grpHdrRef},
+			map[string]any{"header_reference": thdHdrRef},
+		},
+	})))
+	require.NoError(t, err)
+	hdItems := fixtureObject(t, hdOut)["results"].([]any)
+	require.Equal(t, "resolved", hdItems[0].(map[string]any)["status"])
+	require.NotEmpty(t, hdItems[0].(map[string]any)["permit"])
+	require.Equal(t, "resolved", hdItems[1].(map[string]any)["status"])
+	require.NotEmpty(t, hdItems[1].(map[string]any)["permit"])
+
+	// 3. Negative path on real MySQL 8: channel_offset join cutoff and message_extra.`revoke`=1 refuse.
+	_, err = sess.Exec("INSERT INTO channel_offset VALUES('bot','group',2,1)")
+	require.NoError(t, err)
+	cutOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-grp-cutoff-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "2123284828068417536",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": grpDigest,
+	})))
+	require.NoError(t, err)
+	require.Equal(t, "refused", fixtureObject(t, cutOut)["binding"].(map[string]any)["status"])
+	require.Equal(t, "visibility_denied", fixtureObject(t, cutOut)["binding"].(map[string]any)["reason"])
+
+	_, err = sess.Exec("INSERT INTO message_extra(message_id,version,`revoke`,is_deleted,content_edit,content_edit_hash) VALUES('2123284828068417536',1,1,0,NULL,'')")
+	require.NoError(t, err)
+	revOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_delivery",
+		"request_id":              "mysql-grp-revoke-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "2123284828068417536",
+		"message_seq":             "1",
+		"from_uid":                "peer",
+		"observed_payload_sha256": grpDigest,
+	})))
+	require.NoError(t, err)
+	require.Equal(t, "refused", fixtureObject(t, revOut)["binding"].(map[string]any)["status"])
+	require.Equal(t, "expired_reference", fixtureObject(t, revOut)["binding"].(map[string]any)["reason"])
 }

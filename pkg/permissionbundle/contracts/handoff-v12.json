@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "handoff_version": "v12",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "task_key": "XIN-2793",
+  "workspace_id": "620b900b-0dea-443e-b0da-9948b6aa6dcf",
+  "owner_authorization": {
+    "implement_authority": "2123303920984821760",
+    "product_semantics_correction": "2123302644242878464",
+    "trigger_comment_id": "f00d6f74-ffaa-489a-af36-0bd74154839b",
+    "predecessor_tester_task": "XIN-2858 (e99b6140-30fe-4bdc-911f-8bac13c87247)",
+    "predecessor_audit_task": "XIN-2830 (first-persist membership witness proposal WITHDRAWN by Owner 2123302644242878464)"
+  },
+  "repository": {
+    "upstream": "https://github.com/Mininglamp-OSS/octo-server.git",
+    "fork": "https://github.com/boris-clark/octo-server.git",
+    "draft_pr": "https://github.com/Mininglamp-OSS/octo-server/pull/951",
+    "head_branch": "feat/xin-2793-permission-server",
+    "target_branch": "chore/mcp-integration-20261103",
+    "target_base_sha": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+    "parent_commit": "d1cda266944af459fd92db3602f3a054fd31c0c7",
+    "grandparent_commit": "53b0dcc6d176a56746d9da3ab64a65c21c434348",
+    "parent_handoff_file": "pkg/permissionbundle/contracts/handoff-v11.json",
+    "parent_handoff_sha256": "c5a10009f0a13c4190ce703f0f97c58230b800d5f713cf9d3589301056141d63"
+  },
+  "consumed_sibling_pins": {
+    "octo_cli": {
+      "pr": "https://github.com/Mininglamp-OSS/octo-cli/pull/15",
+      "head_sha": "424942e82934a105ed011830d5a482cb0682bd49"
+    },
+    "codex_channel_octo": {
+      "pr": "https://github.com/Mininglamp-OSS/codex-channel-octo/pull/21",
+      "head_sha": "d075be983beb86ae1468cefdcdfa62e21dc9268b"
+    }
+  },
+  "product_semantics_and_native_acl_trace": {
+    "owner_rule": "Joining a group grants access to the group's full history under existing octo-server native current ACL; no send-time or first-persist membership witness is required or introduced.",
+    "native_server_message_acl_paths": [
+      "modules/message/api_message_get.go (channelMessagesSync, searchUserMessages): evaluates current group/thread membership, group/thread status and space_id, message deletion/expiry, message_extra revoke/delete/edit, payload visibles whitelist, per-user message_user_extra deletion, per-user channel_offset (which records both user clear-history and allow_view_history_msg=0 join-time history cutoffs via modules/message/event.go:handleGroupMemberAddEvent), and channel-wide channel_setting.offset_message_seq.",
+      "pkg/permissionbundle/server_message_facts.go (ServerMessageFactProvider.resolveOne, ListHistoryHeadersV1, IssueHistoryDisclosureV1, BindDeliveredMessageV1): evaluates the exact same native current group/thread/DM ACL over octo-server SQL tables under the caller's RepeatableRead transaction.",
+      "pkg/permissionbundle/native_facts_adapter.go (SQLNativeFactAdapter.readResolve, readHistoryHeaders, readHistoryDisclosure, BindDeliveredMessage): combines locking SQL principal/space/group/thread/relation predicates with ServerMessageFactProvider facts."
+    ],
+    "root_cause_before_correction": "In d1cda266944af459fd92db3602f3a054fd31c0c7, ServerMessageFactProvider.resolveOne (pkg/permissionbundle/server_message_facts.go:547-559) set CallerOriginalVisibleUnknown=true and BotOriginalVisibleUnknown=true for all group (channel_type=2) and thread (channel_type=5) messages whenever payload visibles did not exclude the principal. As a result: (1) BindDeliveredMessageV1 emitted unknown_predicates=['bot_original_visible','caller_original_visible'] and resolvable_purposes=['reply'], causing Agent prepareInput to fail closed with PERMISSION_NATIVE_ORIGINAL_VISIBILITY_UNKNOWN; (2) InspectDeliveredHeadersV1 / SQLNativeFactAdapter.readResolve returned status='unavailable', reason='predicate_unsupported' for purpose='admit' and 'contributor'; and (3) IssueHistoryDisclosureV1 returned status='unavailable', reason='disclosure_unavailable' for group/thread headers.",
+    "correction": [
+      "In ServerMessageFactProvider.resolveOne (pkg/permissionbundle/server_message_facts.go), group and thread channels now derive d.CallerOriginalVisible = d.CallerCurrentRead and d.BotOriginalVisible = d.BotCurrentRead from the complete native current read ACL (activeMember && PayloadVisibleTo(msg.payload) && (!extra.edit.Valid || PayloadVisibleTo(editedBody)) && !userHidden) without setting CallerOriginalVisibleUnknown or BotOriginalVisibleUnknown.",
+      "In ServerMessageFactProvider.BindDeliveredMessageV1 (pkg/permissionbundle/server_message_facts.go), visibility_denied is enforced when (!d.MessageSpaceUnknown && !d.MessageSpaceExact) || !d.BotCurrentRead || !d.CallerCurrentRead || !d.MessageRecipientExact, and resolvable_purposes=['admit','contributor','reply'] requires d.CallerOriginalVisible && d.BotOriginalVisible with zero original-visibility unknowns.",
+      "In ServerMessageFactProvider.IssueHistoryDisclosureV1 (pkg/permissionbundle/server_message_facts.go), permit issuance requires !d.CallerOriginalVisibleUnknown && !d.BotOriginalVisibleUnknown && d.CallerCurrentRead && d.CallerOriginalVisible && d.BotCurrentRead && d.BotOriginalVisible in addition to exact space, source, and native message version."
+    ]
+  },
+  "before_after_fixture_comparison": {
+    "current_member_group_and_thread_message_including_pre_join_history_with_allow_view_history_msg_1": {
+      "before_d1cda266": {
+        "bind_delivery": "status=bound, unknown_predicates=['bot_original_visible','caller_original_visible'], resolvable_purposes=['reply']",
+        "resolve_admit_and_contributor": "status=unavailable, reason=predicate_unsupported",
+        "history_disclosure": "status=unavailable, reason=disclosure_unavailable"
+      },
+      "after_v12": {
+        "bind_delivery": "status=bound, unknown_predicates=[], proven_predicates.{caller_current_read,bot_current_read,caller_original_visible,bot_original_visible}=true, resolvable_purposes=['admit','contributor','reply']",
+        "resolve_admit_and_contributor": "status=resolved, predicates.{caller_group_active_member,bot_group_active_member,caller_current_read,bot_current_read,caller_original_visible,bot_original_visible}=true",
+        "history_disclosure": "status=resolved, single-use HMAC permit issued and bound to (bot_uid, space_id, context_id, context_epoch, header_reference, payload_sha256)"
+      }
+    },
+    "pre_cutoff_group_message_where_channel_offset_or_channel_setting_exceeds_or_equals_message_seq": {
+      "before_d1cda266": "bind_delivery refused (visibility_denied for bot offset) or unknown original visibility; history_disclosure unavailable",
+      "after_v12": "bind_delivery refused (reason=visibility_denied) for either bot or caller offset/channel_setting; resolve sets caller_current_read/caller_original_visible or bot_current_read/bot_original_visible to false; history_headers marks item unavailable (expired_reference); history_disclosure returns status=unavailable, reason=disclosure_unavailable with zero permit issued; messages with message_seq > offset continue to bind, resolve, and disclose"
+    },
+    "removed_or_blacklisted_bot_or_caller_or_visibles_exclusion_or_per_user_delete": {
+      "before_d1cda266": "bot removal refused bind_delivery with visibility_denied; caller removal in group left bind_delivery bound for reply",
+      "after_v12": "either bot or caller removal/block in group_member, visibles exclusion (initial or edited payload), or message_user_extra per-user deletion refuses bind_delivery with reason=visibility_denied, sets corresponding current/original read predicates to false in resolve, and refuses history_disclosure with reason=disclosure_unavailable"
+    },
+    "canonical_dm_and_mysql_quoted_revoke_from_d1cda266": {
+      "before_d1cda266": "green",
+      "after_v12": "unchanged and green across SQLite, SQLMock (MySQL dialect), and live MySQL 8.0"
+    }
+  },
+  "receive_before_persistence_timing_boundary": {
+    "reproduction_and_finding": "In live WukongIM + octo-server deployments, WukongIM pushes WKSocket RECV frames to connected Agents in ~2-5ms while batching msg.notify gRPC webhook persistence calls to octo-server (Webhook.handleMessageNotify -> message{N} table insert) by msgNotifyEventPushInterval (default 500ms). When an Agent invokes POST /v1/bot/permission-facts/v1/bind-delivery before Webhook.handleMessageNotify commits the message row in MySQL, loadMessage observes sql.ErrNoRows and returns status='refused', reason='mirror_lag', current=false. Once the webhook persists the row, the identical bind_delivery and resolve(admit) calls immediately return status='bound' and status='resolved'.",
+    "server_boundary_decision": "Returning status='refused', reason='mirror_lag' for unpersisted rows is the mandatory fail-closed Server contract (octo-server must never infer authority from an unpersisted transport frame before message persistence). No server-side sleep or unpersisted-frame bypass was introduced; the pre-persistence (mirror_lag) to post-persistence (bound) transition is covered in TestServerMessageFactsNativeCurrentACLGroupAndThreadAdmissionAndPreJoinHistory."
+  },
+  "verification": {
+    "commands": [
+      "go test -mod=readonly -v -count=1 -run 'TestServerMessageFacts' ./pkg/permissionbundle",
+      "go test -mod=readonly -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -race -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -v -count=1 -run 'TestInstallPermissionBundle' .",
+      "go test -mod=readonly -v -count=1 -run 'TestServerMessageFactHooksUseModuleHelpers' ./modules/message",
+      "go test -mod=readonly -v -count=1 -run 'TestBotPermissionOptInRouteComposition' ./modules/bot_api",
+      "OCTO_TEST_MYSQL_DSN='root:testpass@tcp(127.0.0.1:43309)/octo_test?parseTime=true&charset=utf8mb4' go test -mod=readonly -v -count=1 -run 'TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding' ./pkg/permissionbundle",
+      "go vet -mod=readonly ./pkg/permissionbundle . ./modules/message ./modules/bot_api"
+    ]
+  }
+}

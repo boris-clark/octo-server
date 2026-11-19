@@ -35,7 +35,12 @@ import (
 // cannot prove for a specific reference are flagged on the resolved delivery
 // (MessageSpaceUnknown, MessageVersionUnknown, *OriginalVisibleUnknown) and the
 // SQL adapter turns the affected reference into an explicit unavailable /
-// non-serving result.
+// non-serving result. For group and thread channels, octo-server's native
+// current message read ACL (joining a group grants full history access subject
+// to current group membership, payload visibles, per-user deletion,
+// channel_offset including allow_view_history_msg=0 join cutoffs, and
+// channel_setting.offset_message_seq) defines both current and original
+// message visibility without requiring a separate send-time membership witness.
 //
 // The cut returned by this provider is a read-time marker over ordinary SQL
 // state. It is not an acknowledged-state / restore-safe fence and the provider
@@ -515,8 +520,8 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 		if err1 != nil || err2 != nil {
 			return serverResolution{}, ErrUnavailable
 		}
-		callerVisible := p.hooks.PayloadVisibleTo(msg.payload, authorUID)
-		botVisible := p.hooks.PayloadVisibleTo(msg.payload, botUID)
+		callerVisible := p.hooks.PayloadVisibleTo(msg.payload, authorUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, authorUID))
+		botVisible := p.hooks.PayloadVisibleTo(msg.payload, botUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, botUID))
 		d.MessageAuthorExact = d.MessageAuthorExact && authorIsParticipant
 		d.CallerCurrentRead = authorIsParticipant && callerVisible && !authorHidden
 		d.BotCurrentRead = botVisible && !botHidden
@@ -537,26 +542,21 @@ func (p *ServerMessageFactProvider) resolveOne(ctx context.Context, key Key, ref
 		if err1 != nil || err2 != nil {
 			return serverResolution{}, ErrUnavailable
 		}
-		callerVisible := p.hooks.PayloadVisibleTo(msg.payload, authorUID)
-		botVisible := p.hooks.PayloadVisibleTo(msg.payload, botUID)
+		callerVisible := p.hooks.PayloadVisibleTo(msg.payload, authorUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, authorUID))
+		botVisible := p.hooks.PayloadVisibleTo(msg.payload, botUID) && (!extra.edit.Valid || p.hooks.PayloadVisibleTo(body, botUID))
 		d.MessageRecipientExact = botMember
 		d.CallerCurrentRead = authorMember && callerVisible && !authorHidden
 		d.BotCurrentRead = botMember && botVisible && !botHidden
 		d.CallerParentCurrentRead = authorMember
 		d.BotParentCurrentRead = botMember
-		// Original visibility needs membership history that octo-server does
-		// not keep. A visibles exclusion is a write-time fact and is provably
-		// false; otherwise the value is unknown, never true.
-		if !callerVisible {
-			d.CallerOriginalVisible = false
-		} else {
-			d.CallerOriginalVisibleUnknown = true
-		}
-		if !botVisible {
-			d.BotOriginalVisible = false
-		} else {
-			d.BotOriginalVisibleUnknown = true
-		}
+		// Under octo-server's native group/thread ACL semantics (joining a group
+		// grants access to the group's full history subject to current membership,
+		// payload visibles, per-user deletion, channel_offset including join-time
+		// allow_view_history_msg=0 cutoffs, and channel_setting.offset_message_seq),
+		// current native message read visibility is the authoritative group/thread
+		// visibility fact without a separate send-time membership witness.
+		d.CallerOriginalVisible = d.CallerCurrentRead
+		d.BotOriginalVisible = d.BotCurrentRead
 		_, st, _, gerr := p.groupFacts(ctx, parentGroup)
 		if gerr != nil {
 			return serverResolution{}, gerr
@@ -781,9 +781,9 @@ func (p *ServerMessageFactProvider) IssueHistoryDisclosureV1(ctx context.Context
 			out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: res.unavailable})
 		case !d.MessageVersionExact:
 			out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: "expired_reference"})
-		case d.MessageSpaceUnknown || d.BotOriginalVisibleUnknown:
+		case d.MessageSpaceUnknown || d.BotOriginalVisibleUnknown || d.CallerOriginalVisibleUnknown:
 			out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: "disclosure_unavailable"})
-		case !d.MessageSpaceExact || !d.MessageSourceExact || !d.BotCurrentRead || !d.BotOriginalVisible:
+		case !d.MessageSpaceExact || !d.MessageSourceExact || !d.BotCurrentRead || !d.BotOriginalVisible || !d.CallerCurrentRead || !d.CallerOriginalVisible:
 			out = append(out, IMDisclosureItem{Reference: hr, Status: "unavailable", Reason: "disclosure_unavailable"})
 		default:
 			pmt := p.permit(key, contextID, contextEpoch, hr, res.payloadHash)
@@ -913,7 +913,7 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 			NativeMessageVersion: curVersion,
 		}, cut, nil
 	}
-	if (!d.MessageSpaceUnknown && !d.MessageSpaceExact) || !d.BotCurrentRead || !d.MessageRecipientExact {
+	if (!d.MessageSpaceUnknown && !d.MessageSpaceExact) || !d.BotCurrentRead || !d.CallerCurrentRead || !d.MessageRecipientExact {
 		return DeliveryBindingResultV1{
 			Status:               "refused",
 			Reason:               "visibility_denied",
@@ -955,7 +955,7 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 
 	var purposes []string
 	if !d.MessageSpaceUnknown && d.MessageSpaceExact {
-		if !d.CallerOriginalVisibleUnknown && !d.BotOriginalVisibleUnknown {
+		if !d.CallerOriginalVisibleUnknown && !d.BotOriginalVisibleUnknown && d.CallerOriginalVisible && d.BotOriginalVisible {
 			purposes = []string{"admit", "contributor", "reply"}
 		} else {
 			purposes = []string{"reply"}
