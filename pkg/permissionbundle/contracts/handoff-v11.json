@@ -1,0 +1,79 @@
+{
+  "contract": "permission-server-handoff-v11",
+  "task": "XIN-2793",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "owner_authorization": "2123259331737456640",
+  "trigger_comment": "83f2e27a-aeec-4908-a43f-cc5cbeb6953c",
+  "status": "LOCAL_AUTHOR_REPAIR_NOT_INDEPENDENT_ACCEPTANCE",
+  "scope": "Minimal ACTIVE native-message-binding server repair; handoff-v1 through handoff-v10 remain byte-for-byte historical inputs. Startup, recovery, catalog and authority contracts are unchanged.",
+  "source": {
+    "parent": "53b0dcc6d176a56746d9da3ab64a65c21c434348",
+    "parent_tree": "e5e0687f86aa65a2b99ab5aee53794f90aa4bfa7",
+    "historical_read_only_branch": "boris-clark/octo-server:feat/xin-2793-permission-server",
+    "original_pr": "https://github.com/Mininglamp-OSS/octo-server/pull/951",
+    "target": "Mininglamp-OSS/octo-server:chore/mcp-integration-20261103",
+    "delivery": "Exact local descendant commit and Git bundle/patch for PjM integration; no push, replacement PR, rebase, merge, ready or deployment action. Live PR status was not verified."
+  },
+  "consumed_inputs": {
+    "cli": {
+      "head": "424942e82934a105ed011830d5a482cb0682bd49",
+      "path": "docs/permission/endpoint-abi-v2.json",
+      "sha256": "49b2ed31a4c78a7a7cee3957ea60aa7c6370ac8103d2896d297025c24b17fcb2",
+      "compatibility": "No CLI wire ABI change identified; sibling runtime not executed."
+    },
+    "agent": {
+      "head": "d075be983beb86ae1468cefdcdfa62e21dc9268b",
+      "path": "src/permissions/endpoint-factory.ts",
+      "sha256": "701cb0f988857881e9be4d2a2db323e86bbdd443009c76d283ba3808619f55e5",
+      "compatibility": "Read-only source diagnosis; the downstream source-ID equality and original-group-visibility requirements remain blockers."
+    },
+    "previous_handoff": {
+      "path": "pkg/permissionbundle/contracts/handoff-v10.json",
+      "sha256": "6fa4c5aad2e4e1d30d3ca451b832c1f65897c5920e909962c305d2b817857c82"
+    },
+    "independent_qa": {
+      "task": "XIN-2868",
+      "task_id": "53553638-1071-48aa-8c9c-77a6bc87dfee",
+      "comment_id": "71965ebf-b25a-452e-a9a4-cbc472d389dd",
+      "result": "0 PASS / 1 FAIL / 3 BLOCKED; full report read before editing. These results are not superseded by author fixtures."
+    }
+  },
+  "request_to_storage_trace": [
+    "Agent endpoint-factory.ts:714-737 forwards the observed transport channel ID, type, message ID, sequence, sender and payload hash unchanged.",
+    "modules/bot_api/permission_facts.go:40-67 requires authenticated bf_ User Bot context and explicit space, and derives BotUID from that context rather than the request body.",
+    "Runtime.BindDeliveredMessage in pkg/permissionbundle/native_wire.go opens the checked transaction, verifies provisioned scope when required, and parses the closed request; SQLNativeFactAdapter validates scope and authority before the provider.",
+    "modules/webhook/api.go:290-327 stores persistent DM messages under common.GetFakeChannelIDWith(from_uid, channel_id), not the bare transport peer ID. SyncOnce/NoPersist messages are not durable evidence.",
+    "ServerMessageFactProvider uses the actual message module's shard, payload visibility, payload-space, user-extra and offset hooks. Before this repair, dmPeer rejected a bare peer before any native message lookup.",
+    "After a native row is found, loadExtra queries message_extra. The original query interpolated the MySQL reserved identifier revoke without identifier quoting; provider errors become ErrUnavailable and the existing HTTP 400 / embedded 503 envelope."
+  ],
+  "repairs": {
+    "dm_identity": "For channel_type=1 only, a bare peer ID is converted with existing collision-guarded PairReference(authenticated BotUID, peer). Existing canonical pair IDs still require exact canonical validation. Lookup, returned header.source.id and delivery reference use the canonical physical pair. No space-prefix stripping, alternate lookup or native proof is invented.",
+    "mysql_query": "Quote the existing message_extra column as `revoke` in loadExtra. No schema, migration, data, API or error-envelope change.",
+    "attribution_limit": "The bare-peer refusal is reproduced red-to-green in local fixtures. The SQL query-shape regression is reproduced with SQLMock, not a MySQL server. The retained deployment and its SQL error logs are unavailable on this host, so the live group failure's exact database error is not claimed as captured."
+  },
+  "preserved_boundaries": [
+    "Missing or not-yet-persisted rows fail closed as mirror_lag; no authority is inferred from a transport frame alone.",
+    "Wrong sender, sequence, hash or version, wrong space, per-user deletion, revoked messages, inactive group membership, unrelated/self/noncanonical/ambiguous DM pairs and unsupported predicates remain fail-closed.",
+    "No authentication, native ACL, no-OBO, independent admission/per-operation, OwnerPrepare, atomic CAS, complete GET, departed-member deny retention, containment, replay, authority or recovery contract is weakened.",
+    "Group current native binding can succeed for reply while bot_original_visible and caller_original_visible remain unknown. Current membership does not prove original visibility; admit/contributor is not granted.",
+    "No WukongIM/octo-im, sibling source, tester fixture, shared deployment, runtime, credential or configuration change."
+  ],
+  "author_verification": {
+    "focused_regressions": "PASS: bare and canonical DM binding; identity, absence, space, visibility and ambiguity refusals; current/missing/wrong-space/removed/blocked/revoked group cases; SQLMock quoted-query no-row/revoke cases; Runtime binding regressions.",
+    "permission_package": "PASS: go test -mod=readonly -count=1 ./pkg/permissionbundle",
+    "race": "PASS: go test -mod=readonly -race -count=1 ./pkg/permissionbundle",
+    "composition": "PASS: selected native startup/restart/fencing, real message-hook delegation and Bot route opt-in tests across root, modules/message and modules/bot_api. The changed entrypoint test binds a bare peer and asserts canonical source before restart resolution.",
+    "composition_limit": "SQLite author fixtures with test lock bypass; the root test uses a test HTTP wrapper with a fixed bot identity, not a real authenticated transport session. Route composition separately exercises missing-token handling, not authenticated success.",
+    "vet": "PASS: go vet -mod=readonly ./pkg/permissionbundle . ./modules/message ./modules/bot_api",
+    "build": "PASS: go build -mod=readonly with a task-owned output path; executable not started or deployed",
+    "native_mysql": "NOT_RUN: no local mysqld or stock MySQL image; stock mysql:8.0 image pulls failed at registry authentication with EOF/TLS errors. No registry or daemon configuration changed.",
+    "independent_black_box": "NOT_RUN: PjM-controlled deployment and full independent journeys remain required. No coordinator/model/MCP/Bot journey PASS is claimed."
+  },
+  "required_pjm_follow_up": [
+    "Integrate the exact local commit through the authorized original lineage and run isolated native MySQL bind-delivery validation, preserving absence/refusal before persistence and inspecting the actual SQL error if failure remains.",
+    "At pinned Agent endpoint-factory.ts:881-893, prepareInput compares bound.message.channel_id directly with binding.header.source.id. A bare DM peer differs from the correctly canonical pair, causing PERMISSION_NATIVE_HEADER_MISMATCH. The minimum sibling correction is collision-safe DM pair validation against the authenticated bot and observed peer while preserving message/sender/type/hash checks; do not delete the identity check or make server headers noncanonical. No sibling edit is included.",
+    "At Agent endpoint-factory.ts:889-894, original visibility is mandatory. Counterexample: a bot joins a group after a message was sent; current membership and native persistence cannot establish original visibility. PjM must resolve the supported product/contract boundary or separately authorize a truthful historical-evidence contract; this repair must not infer original visibility or relax admission.",
+    "Run the full independent allowed, denied-invocation, allowed-invocation/denied-write and durable-replay journeys after authorized integration and downstream corrections. Author tests do not replace them."
+  ],
+  "production_activation": "FAIL_CLOSED"
+}

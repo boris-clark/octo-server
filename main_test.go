@@ -605,7 +605,7 @@ func TestInstallPermissionBundleNativeSingleWriterExecutableBoundaryAndRestart(t
 		"operation":               "bind_delivery",
 		"request_id":              "req-main-bind-1",
 		"channel_type":            1,
-		"channel_id":              dmChan,
+		"channel_id":              "peer",
 		"message_id":              "9901",
 		"message_seq":             "1",
 		"from_uid":                "peer",
@@ -617,7 +617,11 @@ func TestInstallPermissionBundleNativeSingleWriterExecutableBoundaryAndRestart(t
 	require.NotContains(t, rec.Body.String(), "ENTRYPOINT-SECRET")
 	var bindEnv map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &bindEnv))
-	delivRef := bindEnv["binding"].(map[string]any)["delivery_reference"].(string)
+	binding := bindEnv["binding"].(map[string]any)
+	require.Equal(t, "bound", binding["status"])
+	header := binding["header"].(map[string]any)
+	require.Equal(t, dmChan, header["source"].(map[string]any)["id"])
+	delivRef := binding["delivery_reference"].(string)
 
 	// 3. Normal process restart (OCTO_PERMISSION_BUNDLE_AUTHORITY_PROVISION=false) on the same SQL + statePath.
 	t.Setenv(permissionbundle.EnvPermissionBundleAuthorityProvision, "false")

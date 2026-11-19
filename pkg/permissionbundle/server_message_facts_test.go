@@ -3,6 +3,7 @@ package permissionbundle
 import (
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"github.com/Mininglamp-OSS/octo-lib/config"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/gocraft/dbr/v2"
+	"github.com/gocraft/dbr/v2/dialect"
 	"github.com/stretchr/testify/require"
 )
 
@@ -380,6 +384,127 @@ func sha256OfJSON(v map[string]any) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TestServerMessageFactsNativeDMBindingChannelIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name, channel, from, reason string
+	}{
+		{name: "peer", channel: "peer", from: "peer"},
+		{name: "canonical pair", channel: "canonical", from: "peer"},
+		{name: "wrong sender", channel: "peer", from: "departed", reason: "identity_mismatch"},
+		{name: "unrelated peer", channel: "departed", from: "peer", reason: "mirror_lag"},
+		{name: "self", channel: "bot", from: "peer", reason: "predicate_unsupported"},
+		{name: "ambiguous pair", channel: "bot@peer@other", from: "peer", reason: "predicate_unsupported"},
+		{name: "unrelated pair", channel: "other@peer", from: "peer", reason: "predicate_unsupported"},
+		{name: "noncanonical pair", channel: "reversed", from: "peer", reason: "predicate_unsupported"},
+		{name: "space-prefixed peer", channel: "s" + strings.Repeat("a", 32) + "_peer", from: "peer", reason: "mirror_lag"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newServerFacts(t)
+			payload := map[string]any{"type": 1, "space_id": "space", "content": "NATIVE-DM-SECRET"}
+			f.msg("2123243234824982528", 4, "peer", f.dmChan, 1, payload)
+			channel := tc.channel
+			if channel == "canonical" {
+				channel = f.dmChan
+			} else if channel == "reversed" {
+				parts := strings.Split(f.dmChan, "@")
+				channel = parts[1] + "@" + parts[0]
+			}
+			req := DeliveryBindingRequestV1{ChannelType: 1, ChannelID: channel, MessageID: "2123243234824982528", MessageSeq: "4", FromUID: tc.from, ObservedPayloadSHA256: sha256OfJSON(payload)}
+			got, _, err := f.p.BindDeliveredMessageV1(t.Context(), fixtureKey, req)
+			require.NoError(t, err)
+			if tc.reason != "" {
+				require.Equal(t, "refused", got.Status)
+				require.Equal(t, tc.reason, got.Reason)
+				require.False(t, got.Current)
+				require.Empty(t, got.DeliveryReference)
+				return
+			}
+			require.Equal(t, "bound", got.Status)
+			require.Equal(t, f.dmChan, got.Header.Source.ID)
+			require.Equal(t, ServerDeliveryReference(1, f.dmChan, req.MessageID, "x0_0"), got.DeliveryReference)
+			require.Equal(t, []string{"admit", "contributor", "reply"}, got.ResolvablePurposes)
+			require.Empty(t, got.UnknownPredicates)
+			require.NotContains(t, string(canonical(got.Header.toMap())), "NATIVE-DM-SECRET")
+			require.Equal(t, "resolved", f.resolve("admit", got.DeliveryReference)[0].Status)
+
+			req.MessageID = "2123243234824982529"
+			missing, _, err := f.p.BindDeliveredMessageV1(t.Context(), fixtureKey, req)
+			require.NoError(t, err)
+			require.Equal(t, "refused", missing.Status)
+			require.Equal(t, "mirror_lag", missing.Reason)
+
+			req.MessageID = "2123243234824982528"
+			otherKey := fixtureKey
+			otherKey.SpaceID = "other-space"
+			wrongSpace, _, err := f.p.BindDeliveredMessageV1(t.Context(), otherKey, req)
+			require.NoError(t, err)
+			require.Equal(t, "refused", wrongSpace.Status)
+			require.Equal(t, "visibility_denied", wrongSpace.Reason)
+
+			f.exec("INSERT INTO message_user_extra VALUES('bot',?,1)", req.MessageID)
+			hidden, _, err := f.p.BindDeliveredMessageV1(t.Context(), fixtureKey, req)
+			require.NoError(t, err)
+			require.Equal(t, "refused", hidden.Status)
+			require.Equal(t, "visibility_denied", hidden.Reason)
+		})
+	}
+}
+
+func TestServerMessageFactsNativeGroupBindingRefusals(t *testing.T) {
+	for _, tc := range []struct {
+		name, mutation, reason string
+	}{
+		{name: "current"},
+		{name: "missing", mutation: "DELETE FROM message", reason: "mirror_lag"},
+		{name: "wrong space", mutation: "UPDATE `group` SET space_id='other-space'", reason: "visibility_denied"},
+		{name: "removed bot", mutation: "UPDATE group_member SET is_deleted=1 WHERE uid='bot'", reason: "visibility_denied"},
+		{name: "blocked bot", mutation: "UPDATE group_member SET status=0 WHERE uid='bot'", reason: "visibility_denied"},
+		{name: "revoked", mutation: "INSERT INTO message_extra VALUES('2123243248167063552',1,1,0,NULL,'')", reason: "expired_reference"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newServerFacts(t)
+			payload := map[string]any{"type": 1, "content": "NATIVE-GROUP-SECRET"}
+			f.msg("2123243248167063552", 3, "peer", "group", 2, payload)
+			if tc.mutation != "" {
+				f.exec(tc.mutation)
+			}
+			req := DeliveryBindingRequestV1{ChannelType: 2, ChannelID: "group", MessageID: "2123243248167063552", MessageSeq: "3", FromUID: "peer", ObservedPayloadSHA256: sha256OfJSON(payload)}
+			got, _, err := f.p.BindDeliveredMessageV1(t.Context(), fixtureKey, req)
+			require.NoError(t, err)
+			if tc.reason != "" {
+				require.Equal(t, "refused", got.Status)
+				require.Equal(t, tc.reason, got.Reason)
+				require.False(t, got.Current)
+				return
+			}
+			require.Equal(t, "bound", got.Status)
+			require.Equal(t, []string{"reply"}, got.ResolvablePurposes)
+			require.Equal(t, []string{"bot_original_visible", "caller_original_visible"}, got.UnknownPredicates)
+			require.NotContains(t, string(canonical(got.Header.toMap())), "NATIVE-GROUP-SECRET")
+		})
+	}
+}
+
+func TestServerMessageFactsMySQLExtraQuery(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherEqual))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	conn := &dbr.Connection{DB: db, EventReceiver: &dbr.NullEventReceiver{}, Dialect: dialect.MySQL}
+	p := &ServerMessageFactProvider{db: conn.NewSession(nil)}
+	query := "SELECT COALESCE(version,0),COALESCE(`revoke`,0),COALESCE(is_deleted,0),content_edit,COALESCE(content_edit_hash,'') FROM message_extra WHERE message_id=?"
+	mock.ExpectQuery(query).WithArgs("2123243248167063552").WillReturnError(sql.ErrNoRows)
+	extra, err := p.loadExtra(t.Context(), "2123243248167063552")
+	require.NoError(t, err)
+	require.False(t, extra.exists)
+	mock.ExpectQuery(query).WithArgs("2123243248167063552").WillReturnRows(sqlmock.NewRows([]string{"version", "revoke", "is_deleted", "content_edit", "content_edit_hash"}).AddRow(2, 1, 0, nil, ""))
+	extra, err = p.loadExtra(t.Context(), "2123243248167063552")
+	require.NoError(t, err)
+	require.True(t, extra.exists)
+	require.Equal(t, 1, extra.revoke)
+	require.NoError(t, mock.ExpectationsWereMet())
+	mock.ExpectClose()
+}
+
 func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testing.T) {
 	ctx := t.Context()
 	driver := newSyntheticExternalAuthorityDriver(fixturePin.Digest)
@@ -432,7 +557,7 @@ func TestServerMessageFactsBindDeliveredMessagePositiveAndRaceRefusals(t *testin
 		"operation":               "bind_delivery",
 		"request_id":              "req-bind-dm-1",
 		"channel_type":            json.Number("1"),
-		"channel_id":              f.dmChan,
+		"channel_id":              "peer",
 		"message_id":              "7001",
 		"message_seq":             "1",
 		"from_uid":                "peer",

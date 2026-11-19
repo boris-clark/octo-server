@@ -282,7 +282,7 @@ func (p *ServerMessageFactProvider) loadMessage(ctx context.Context, r serverRef
 
 func (p *ServerMessageFactProvider) loadExtra(ctx context.Context, messageID string) (serverExtraRow, error) {
 	var e serverExtraRow
-	err := p.one(ctx, "SELECT COALESCE(version,0),COALESCE(revoke,0),COALESCE(is_deleted,0),content_edit,COALESCE(content_edit_hash,'') FROM message_extra WHERE message_id=?"+p.lockSuffix(ctx),
+	err := p.one(ctx, "SELECT COALESCE(version,0),COALESCE(`revoke`,0),COALESCE(is_deleted,0),content_edit,COALESCE(content_edit_hash,'') FROM message_extra WHERE message_id=?"+p.lockSuffix(ctx),
 		[]any{messageID}, &e.version, &e.revoke, &e.deleted, &e.edit, &e.hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		return serverExtraRow{}, nil
@@ -867,6 +867,11 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 		channelID:   req.ChannelID,
 		messageID:   req.MessageID,
 	}
+	if req.ChannelType == channelTypePerson && !strings.Contains(req.ChannelID, "@") {
+		if pair, err := PairReference(key.BotUID, req.ChannelID); err == nil {
+			ref.channelID = pair["id"].(string)
+		}
+	}
 	res, err := p.resolveOne(ctx, key, ref)
 	if err != nil {
 		return DeliveryBindingResultV1{}, IMAuthorityCut{}, err
@@ -957,7 +962,7 @@ func (p *ServerMessageFactProvider) BindDeliveredMessageV1(ctx context.Context, 
 		}
 	}
 
-	deliveryRef := ServerDeliveryReference(req.ChannelType, req.ChannelID, req.MessageID, curVersion)
+	deliveryRef := ServerDeliveryReference(ref.channelType, ref.channelID, ref.messageID, curVersion)
 	return DeliveryBindingResultV1{
 		Status:                "bound",
 		Current:               true,
