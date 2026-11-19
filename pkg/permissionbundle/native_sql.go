@@ -19,14 +19,11 @@ import (
 // These are configuration-time facts, not original-message/read/send authority.
 type SQLNative struct{ testNoLocks bool }
 
-func (n SQLNative) suffix(absence bool) string {
+func (n SQLNative) suffix(_ bool) string {
 	if n.testNoLocks {
 		return ""
 	}
-	if absence {
-		return " FOR SHARE"
-	}
-	return " FOR SHARE NOWAIT"
+	return " FOR SHARE"
 }
 func queryOne(ctx context.Context, tx *dbr.Tx, q string, args []any, dest ...any) error {
 	ctx, cancel := context.WithTimeout(ctx, time.Second)

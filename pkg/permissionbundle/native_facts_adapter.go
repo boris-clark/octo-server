@@ -291,6 +291,31 @@ func factReadTxFromContext(ctx context.Context) (factReadTxContext, bool) {
 	return v, ok && v.tx != nil
 }
 
+type activeAuthorityReadKey struct{}
+
+type activeAuthorityReadContext struct {
+	tx   *dbr.Tx
+	auth AuthorityRead
+}
+
+func withActiveAuthorityRead(ctx context.Context, tx *dbr.Tx, auth AuthorityRead) context.Context {
+	if tx == nil || auth == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, activeAuthorityReadKey{}, activeAuthorityReadContext{tx: tx, auth: auth})
+}
+
+func activeAuthorityReadFromContext(ctx context.Context, tx *dbr.Tx) (AuthorityRead, bool) {
+	if ctx == nil || tx == nil {
+		return nil, false
+	}
+	v, ok := ctx.Value(activeAuthorityReadKey{}).(activeAuthorityReadContext)
+	if !ok || v.tx != tx || v.auth == nil {
+		return nil, false
+	}
+	return v.auth, true
+}
+
 type sqlCutVerifier interface {
 	VerifySQLAuthorityCut(authorityID, incarnation, position string) error
 }
@@ -321,14 +346,18 @@ func NewSQLNativeFactAdapter(authority FencedAuthority, imProvider NativeIMFactP
 	}, nil
 }
 
-func (a *SQLNativeFactAdapter) suffix(absence bool) string {
+func (a *SQLNativeFactAdapter) suffix(_ bool) string {
 	if a.testNoLocks {
 		return ""
 	}
-	if absence {
-		return " FOR SHARE"
+	return " FOR SHARE"
+}
+
+func (a *SQLNativeFactAdapter) beginAuthorityRead(ctx context.Context, tx *dbr.Tx) (AuthorityRead, error) {
+	if authRead, ok := activeAuthorityReadFromContext(ctx, tx); ok {
+		return authRead, nil
 	}
-	return " FOR SHARE NOWAIT"
+	return a.Authority.Begin(ctx, tx)
 }
 
 func randomHex32() (string, error) {
@@ -385,7 +414,7 @@ func (a *SQLNativeFactAdapter) Read(ctx context.Context, tx *dbr.Tx, key Key, re
 		return nil, err
 	}
 	sqlStarted := time.Now().UTC().Truncate(time.Microsecond)
-	authRead, err := a.Authority.Begin(ctx, tx)
+	authRead, err := a.beginAuthorityRead(ctx, tx)
 	if err != nil || authRead == nil || !validHex(authRead.Incarnation(), 32) {
 		return nil, ErrUnavailable
 	}
@@ -442,7 +471,7 @@ func (a *SQLNativeFactAdapter) BindDeliveredMessage(ctx context.Context, tx *dbr
 		return nil, err
 	}
 	sqlStarted := time.Now().UTC().Truncate(time.Microsecond)
-	authRead, err := a.Authority.Begin(ctx, tx)
+	authRead, err := a.beginAuthorityRead(ctx, tx)
 	if err != nil || authRead == nil || !validHex(authRead.Incarnation(), 32) {
 		return nil, ErrUnavailable
 	}

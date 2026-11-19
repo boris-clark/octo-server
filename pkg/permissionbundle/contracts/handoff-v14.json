@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "handoff_version": "v14",
+  "contract_version": "v2_async_ingress_separation",
+  "task_id": "6a92a547-cb82-4c3d-ac6c-8f5529028ba4",
+  "task_key": "XIN-2793",
+  "workspace_id": "620b900b-0dea-443e-b0da-9948b6aa6dcf",
+  "owner_authorization": {
+    "implement_authority": "2123331688342654976",
+    "prior_decisions_retained": [
+      "2123326487372140544",
+      "2123331461770547200",
+      "2123303920984821760",
+      "2123302644242878464"
+    ],
+    "trigger_comment_id": "c1f71190-c8a2-4a3b-ad67-d1a72fd733fb",
+    "followup_authorization_comment_id": "d801f917-00a6-49e5-a623-4d89a0769eae",
+    "prior_trigger_comment_ids": [
+      "8f1a6726-2b61-4b21-8ea9-5a2606b185b5",
+      "9fe15972-80e5-437b-adac-02831cdcf99d",
+      "265d3a6c-902a-4710-a60f-d50e95f97f69"
+    ]
+  },
+  "repository": {
+    "upstream": "https://github.com/Mininglamp-OSS/octo-server.git",
+    "fork": "https://github.com/boris-clark/octo-server.git",
+    "draft_pr": "https://github.com/Mininglamp-OSS/octo-server/pull/951",
+    "head_branch": "feat/xin-2793-permission-server",
+    "target_branch": "chore/mcp-integration-20261103",
+    "target_base_sha": "79701d4912eba79a8bcb02c58ed86609c38335e2",
+    "parent_commit": "9980d29e69020c12e3dd3b5135520c1367e12356",
+    "grandparent_commit": "ab056abd74c3b61d7f86a238a16b3966f84cb723",
+    "great_grandparent_commit": "d1cda266944af459fd92db3602f3a054fd31c0c7",
+    "parent_handoff_file": "pkg/permissionbundle/contracts/handoff-v13.json",
+    "parent_handoff_sha256": "d8b0ed5015be571d8bd28fc7ea258e59093f5e657e623d6dc9cadfe7484c9ef4"
+  },
+  "consumed_sibling_pins": {
+    "octo_cli": {
+      "task_key": "XIN-2794",
+      "task_id": "229ad215-8526-4a04-8f5b-36f073f81a16",
+      "pr": "https://github.com/Mininglamp-OSS/octo-cli/pull/15",
+      "xin2858_tested_head_sha": "7a1ca54a5a4dbbfad3d329fab9e5cca28390ffc6",
+      "delivered_head_sha": "c23aedbb10a425655dd63b89c68175affb102273",
+      "delivery_comment_id": "96594bfb-9f78-4dbe-870a-9c8c79cc6f2e",
+      "attachment_id": "01a1f353-8910-7b94-97b4-a08c4ca29d8c",
+      "attachment_sha256": "5e2a37590da16c8a820cb5400cf8d17841aacace1dc84efddbd85d4c332ba059",
+      "cli_component_contract_v9_sha256": "85a18054472156115ae569666acc0553b7823757df9d071bb9bbf1c28d082d70",
+      "contract_manifest_v9_sha256": "204901a34418f6a120e27c34237e606a1cdd708ca46b082921ca3e522e6ad0c9"
+    },
+    "codex_channel_octo": {
+      "task_key": "XIN-2795",
+      "task_id": "2f4a34e9-2be3-48ac-99f0-38a30f077acd",
+      "pr": "https://github.com/Mininglamp-OSS/codex-channel-octo/pull/21",
+      "deployed_head_sha": "fa7896a845aaab16fdda926b4b406dfa47a3a3e4",
+      "delivered_tree_sha": "c394c5a84d586a98b05cb73e2248e635354b5807",
+      "handoff_file": "docs/permission-endpoint-handoff-v8.json",
+      "handoff_sha256": "dcabcc17e2d4c86f6801845d7f932870a1a176ff3fd8b3c0a42ddf45b16c8e7e",
+      "attachment_id": "01a1f306-ecbc-7822-ba6a-fc11e57e5dd7"
+    },
+    "xin_2858_live_evidence": {
+      "task_key": "XIN-2858",
+      "outcome_comment_id": "d8efbd60-157c-41ca-8193-c67978578db2",
+      "attachment_id": "01a1f32e-3f39-7c49-a291-3f5eb831e0b5",
+      "attachment_sha256": "30cb4b2a616f9f9670669a9bba6ece383948c88a215c70c9988175c2f8ecea52"
+    }
+  },
+  "xin_2858_diagnosis_and_server_fixes": {
+    "admit_policy_unavailable_root_cause": {
+      "log_file": "managed-runtime-live.log",
+      "server_http_status_in_run": "All 7 NATIVE_FACT_TRACE HTTP requests from codex-channel-octo to octo-server returned http_status=200 (zero HTTP 400 in that run). Both bind_live_ingress and register_ingress (resolve purpose=admit on l1-... before trigger persistence) succeeded.",
+      "bundle_fetch_status": "During handleControl(admit) in octo-cli/internal/mcp/permission_host.go, GET /v1/bot/permission-bundle/v1 and ParseBundle succeeded (any error there returns status='unavailable', reason='authority_unavailable', whereas admit returned status='refused', category='policy_unavailable').",
+      "refusal_location": "octo-cli/internal/permission/coordinator.go:1936-1938 -> compiledFixturePolicy.validBundle(p) (coordinator.go:1805-1831 in 7a1ca54a5a4dbbfad3d329fab9e5cca28390ffc6), configured by IsolatedTestFixturePolicy() in octo-cli/internal/mcp/permission_bootstrap.go:666-698.",
+      "exact_mechanism": "In 7a1ca54a5a4dbbfad3d329fab9e5cca28390ffc6, IsolatedTestFixturePolicy() placed write capabilities (octo-cli/docs/op/docs.create, octo-cli/docs/op/docs.scene.edit, octo-cli/docs/op/docs.scene.get) in DeniedCapabilities (absent from fp.allowed), and compiledFixturePolicy.validBundle(p) rejected the entire bundle at Stage 1 Admit time with status='refused', category='policy_unavailable' whenever any rule in p.Capability.Rules with effect=='allow' contained a capability ID outside fp.allowed. When XIN-2858 switched revision 9 to 'permitted/writes-allowed' via fixture.py, the bundle included write capabilities in an allow rule, causing compiledFixturePolicy.validBundle(p) in octo-cli 7a1ca54a to refuse Stage 1 Admit (repaired in XIN-2794 c23aedbb10a425655dd63b89c68175affb102273)."
+    },
+    "intermittent_native_facts_http_400_root_causes_and_fixes": {
+      "d14_transport_mapping": "Under D14 legacy transport compatibility (pkg/httperr/respond.go:22-72), permissionbundle.RespondError maps all permissionbundle.Error values — including ErrUnavailable (err.server.mcp.policy_unavailable, semantic 503) and ErrReconcile (err.server.mcp.reconcile_failed, semantic 503) — to HTTP transport status 400 on the wire.",
+      "defect_1_for_share_nowait_innodb_lock_abort": {
+        "cause": "ServerMessageFactProvider, SQLNativeFactAdapter, SQLNative, Store.read(SHARE), and Runtime.commitAssociations appended FOR SHARE NOWAIT on shared MySQL tables (message..message4, bot_permission_scope, group, user, robot). Under live WukongIM webhook traffic (POST /v1/webhook?event=msg.notify executing INSERT INTO message{N} ... ON DUPLICATE KEY UPDATE payload=payload) or concurrent scope updates, overlapping bind_live_ingress and resolve queries aborted immediately with MySQL Error 3572 (ER_LOCK_NOWAIT) instead of waiting a few milliseconds for the short row write to commit, mapping to ErrUnavailable -> HTTP 400.",
+        "fix": "Replaced FOR SHARE NOWAIT on shared read queries (server_message_facts.go, native_facts_adapter.go, native_sql.go, store.go lock=='SHARE', runtime.go commitAssociations, and authority_fence.go forUpdate==false) with bounded FOR SHARE governed by the existing 2-second context deadline, while preserving FOR UPDATE NOWAIT on exclusive write locks."
+      },
+      "defect_2_double_authority_begin_per_request": {
+        "cause": "Runtime.Facts and Runtime.BindDeliveredMessage called r.store.begin(ctx) (which invoked s.Authority.Begin(ctx, tx) #1, allocating Position N+1), and then SQLNativeFactAdapter.Read / BindDeliveredMessage called a.Authority.Begin(ctx, tx) #2 on the same transaction t.tx (allocating Position N+2 and returning sql.position='N+2' on the wire). When complete(ctx, t) ran, t.authority.Complete(ctx) only acknowledged Position N+1, leaving committed_position (N+2) > acknowledged_position (N+1) after every permission-facts call and advancing sql.position by 2 per request.",
+        "fix": "Added withActiveAuthorityRead(ctx, t.tx, t.authority) in native_facts_adapter.go and native_wire.go so SQLNativeFactAdapter.Read and BindDeliveredMessage reuse the outer transaction's already-begun AuthorityRead. Each permission-facts call now allocates and acknowledges exactly 1 monotonic SQL authority position with committed_position == acknowledged_position == reported sql.position."
+      },
+      "defect_3_lineage_latch_on_context_cancel_and_ungated_commit_associations": {
+        "cause": "NativeSingleWriterLineageDriver permanently latched in-memory d.failed=true even when readSQLRow or post-commit RecordAcknowledgedPosition failed solely because the caller's HTTP request context was canceled (e.g., client timeout/disconnect), poisoning all subsequent requests with ErrUnavailable (HTTP 400) until process restart. In addition, Runtime.commitAssociations bypassed FencedAuthorityAdapter.acquireTxGate(ctx).",
+        "fix": "In authority_fence.go, AcquireCurrent and AssertCurrent only latch d.failed=true when ctx.Err()==nil; RecordAcknowledgedPosition runs its post-commit checkpoint update under context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second); and Runtime.commitAssociations acquires acquireTxGate(ctx) before beginning its transaction."
+      },
+      "wire_compatibility_with_cli_c23aedbb_and_agent_fa7896a8": {
+        "fix": "parseDeliveryBindingRequest (bind_live_ingress / bind_delivery) and validateEvaluateCurrentAccessRequest (evaluate_current_access) accept optional profile_version=1 and canonical DM pair channel_id values up to 400 chars, preserving exact compatibility with both codex-channel-octo fa7896a845aaab16fdda926b4b406dfa47a3a3e4 and octo-cli c23aedbb10a425655dd63b89c68175affb102273."
+      }
+    }
+  },
+  "verification": {
+    "commands": [
+      "go test -mod=readonly -v -count=1 -run 'TestXIN2793SingleStepAuthorityPositionAndCancellationResilience|TestServerMessageFactsNativeSingleWriterLineageConcurrentLiveIngress|TestServerMessageFactsAsyncIngressSeparationWithoutTriggerRow' ./pkg/permissionbundle",
+      "go test -mod=readonly -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -race -count=1 ./pkg/permissionbundle",
+      "go test -mod=readonly -v -count=1 -run 'TestInstallPermissionBundle' .",
+      "go test -mod=readonly -v -count=1 -run 'TestServerMessageFactHooksUseModuleHelpers' ./modules/message",
+      "go test -mod=readonly -v -count=1 -run 'TestBotPermissionOptInRouteComposition|TestPermission' ./modules/bot_api",
+      "OCTO_TEST_MYSQL_DSN='root:testpass@tcp(127.0.0.1:<port>)/octo_test?parseTime=true&loc=UTC' go test -v -race -run 'TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding' ./pkg/permissionbundle/...",
+      "go vet -mod=readonly ./pkg/permissionbundle . ./modules/message ./modules/bot_api",
+      "go build -o /tmp/octo-server-xin2793-build-check ."
+    ]
+  }
+}

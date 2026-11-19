@@ -457,7 +457,7 @@ func (d *NativeSingleWriterLineageDriver) lockSuffix(forUpdate bool) string {
 	if forUpdate {
 		return " FOR UPDATE NOWAIT"
 	}
-	return " FOR SHARE NOWAIT"
+	return " FOR SHARE"
 }
 
 func (d *NativeSingleWriterLineageDriver) computeMAC(domain string, parts ...string) string {
@@ -930,7 +930,9 @@ func (d *NativeSingleWriterLineageDriver) AcquireCurrent(ctx context.Context, tx
 	}
 	sqlRow, sqlExists, err := d.readSQLRow(ctx, tx, false)
 	if err != nil || !sqlExists {
-		d.failed = true
+		if err == nil || ctx.Err() == nil {
+			d.failed = true
+		}
 		return ElectedAuthoritySession{}, fmt.Errorf("%w: SQL authority lineage unavailable during AcquireCurrent", ErrUnavailable)
 	}
 	if sqlRow.ActiveWriterID != d.activeWriterID || sqlRow.ElectionGeneration != d.electionGeneration || sqlRow.AcknowledgedPosition < hostState.MinAckPosition {
@@ -975,7 +977,9 @@ func (d *NativeSingleWriterLineageDriver) AssertCurrent(ctx context.Context, tx 
 	}
 	sqlRow, sqlExists, err := d.readSQLRow(ctx, tx, false)
 	if err != nil || !sqlExists || sqlRow.ActiveWriterID != d.activeWriterID || sqlRow.ElectionGeneration != d.electionGeneration || sqlRow.AcknowledgedPosition < hostState.MinAckPosition {
-		d.failed = true
+		if err == nil || ctx.Err() == nil {
+			d.failed = true
+		}
 		return ErrUnavailable
 	}
 	return nil
@@ -995,7 +999,13 @@ func (d *NativeSingleWriterLineageDriver) RecordAcknowledgedPosition(ctx context
 		d.failed = true
 		return ErrReconcile
 	}
-	sqlRow, sqlExists, err := d.readSQLRow(ctx, d.session, false)
+	ackBaseCtx := context.Background()
+	if ctx != nil {
+		ackBaseCtx = context.WithoutCancel(ctx)
+	}
+	qCtx, cancel := context.WithTimeout(ackBaseCtx, 2*time.Second)
+	defer cancel()
+	sqlRow, sqlExists, err := d.readSQLRow(qCtx, d.session, false)
 	if err != nil || !sqlExists || sqlRow.ActiveWriterID != d.activeWriterID || sqlRow.ElectionGeneration != d.electionGeneration || sqlRow.AcknowledgedPosition < hostState.MinAckPosition {
 		d.failed = true
 		return ErrReconcile
@@ -1026,8 +1036,6 @@ func (d *NativeSingleWriterLineageDriver) RecordAcknowledgedPosition(ctx context
 	}
 	updated.StateHMAC = d.sqlStateMAC(updated)
 	now := time.Now().UTC().UnixNano()
-	qCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
 	res, err := d.session.ExecContext(qCtx,
 		`UPDATE `+NativeAuthorityLineageTable+` SET committed_position=?,acknowledged_position=?,recoverable_scope_checkpoint=?,state_hmac=?,updated_at=? WHERE singleton=1 AND authority_id=? AND incarnation=? AND active_writer_id=? AND election_generation=? AND state_hmac=?`,
 		int64(updated.CommittedPosition), int64(updated.AcknowledgedPosition), int64(updated.RecoverableScopeCheckpoint), updated.StateHMAC, now,

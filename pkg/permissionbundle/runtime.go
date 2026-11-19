@@ -117,6 +117,17 @@ func (r *Runtime) commitAssociations(ctx context.Context, tx *dbr.Tx, associatio
 	if tx == nil {
 		return ErrUnavailable
 	}
+	releaseGate := func() {}
+	if gated, ok := r.store.Authority.(interface {
+		acquireTxGate(context.Context) (func(), error)
+	}); ok {
+		var err error
+		releaseGate, err = gated.acquireTxGate(ctx)
+		if err != nil {
+			return err
+		}
+	}
+	defer releaseGate()
 	a, e := r.store.Authority.Begin(ctx, tx)
 	if e != nil || a == nil || !validHex(a.Incarnation(), 32) {
 		return ErrUnavailable
@@ -145,7 +156,7 @@ func (r *Runtime) commitAssociations(ctx context.Context, tx *dbr.Tx, associatio
 		// A human or built-in/nonhuman association creates no User Bot policy.
 		q := `SELECT robot FROM user WHERE uid=?`
 		if !r.store.testNoLocks {
-			q += " FOR SHARE NOWAIT"
+			q += " FOR SHARE"
 		}
 		var robot int
 		e = queryOne(ctx, tx, q, []any{key.BotUID}, &robot)
@@ -160,7 +171,7 @@ func (r *Runtime) commitAssociations(ctx context.Context, tx *dbr.Tx, associatio
 		}
 		q = `SELECT creator_uid,COALESCE(bot_token,'') FROM robot WHERE robot_id=?`
 		if !r.store.testNoLocks {
-			q += " FOR SHARE NOWAIT"
+			q += " FOR SHARE"
 		}
 		var creator, token string
 		e = queryOne(ctx, tx, q, []any{key.BotUID}, &creator, &token)

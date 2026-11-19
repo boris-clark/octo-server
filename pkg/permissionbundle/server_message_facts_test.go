@@ -2,10 +2,12 @@ package permissionbundle
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"github.com/Mininglamp-OSS/octo-lib/config"
 	"os"
 	"path/filepath"
@@ -1919,6 +1921,158 @@ func TestServerMessageFactsLiveMySQLNativeCurrentACLGroupAndDMBinding(t *testing
 	for err := range errCh {
 		require.NoError(t, err)
 	}
+
+	// 6. Real MySQL 8 InnoDB concurrent webhook writer (`INSERT INTO message ... ON DUPLICATE KEY UPDATE`)
+	// overlapping with bind_live_ingress and resolve(admit|reply):
+	// Under the old FOR SHARE NOWAIT, touching the locked row/gap aborted immediately with Error 3572 (ER_LOCK_NOWAIT -> ErrUnavailable -> HTTP 400).
+	// Under bounded FOR SHARE, concurrent readers wait cleanly for the millisecond writer to commit and succeed with HTTP 200.
+	delayedMsgID := "2123350999999990001"
+	delayedSeq := "305"
+	delayedPayload := map[string]any{"type": 1, "content": "MYSQL-DELAYED-WEBHOOK-TRIGGER"}
+	delayedBytes, _ := json.Marshal(delayedPayload)
+	delayedDigest := sha256OfJSON(delayedPayload)
+
+	// (a) Before webhook persistence (absent trigger): bind_live_ingress and resolve(admit) succeed with trigger_row_persisted=false.
+	preBindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_live_ingress",
+		"request_id":              "mysql-delayed-pre-bind",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              delayedMsgID,
+		"message_seq":             delayedSeq,
+		"from_uid":                "peer",
+		"observed_payload_sha256": delayedDigest,
+	})))
+	require.NoError(t, err)
+	preBinding := fixtureObject(t, preBindOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", preBinding["status"])
+	require.Equal(t, false, preBinding["trigger_row_persisted"])
+	require.Equal(t, false, preBinding["content_attested_by_server"])
+	delayedLiveRef := preBinding["delivery_reference"].(string)
+	preHeaderJSON := string(canonical(preBinding["header"]))
+
+	// (b) Hold an uncommitted InnoDB transaction that inserts/locks delayedMsgID for 80ms while bind_live_ingress,
+	// resolve(admit), resolve(reply), and Runtime.Get execute concurrently.
+	writerTx, err := sess.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	require.NoError(t, err)
+	_, err = writerTx.Exec(
+		"INSERT INTO message VALUES(?,305,'peer','group',2,1700000305,?,0,0) ON DUPLICATE KEY UPDATE payload=payload",
+		delayedMsgID, delayedBytes,
+	)
+	require.NoError(t, err)
+
+	writerDone := make(chan error, 1)
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		writerDone <- writerTx.Commit()
+	}()
+
+	var lockWg sync.WaitGroup
+	lockErrCh := make(chan error, 8)
+	var postCommitResolveHeader string
+	lockWg.Add(3)
+	go func() {
+		defer lockWg.Done()
+		_, bErr := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":          json.Number("1"),
+			"operation":               "bind_live_ingress",
+			"request_id":              "mysql-delayed-during-lock-bind",
+			"channel_type":            json.Number("2"),
+			"channel_id":              "group",
+			"message_id":              delayedMsgID,
+			"message_seq":             delayedSeq,
+			"from_uid":                "peer",
+			"observed_payload_sha256": delayedDigest,
+		})))
+		if bErr != nil {
+			lockErrCh <- bErr
+		}
+	}()
+	go func() {
+		defer lockWg.Done()
+		rOut, rErr := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      strings.Repeat("d", 32),
+			"operation":       "resolve",
+			"purpose":         "reply",
+			"references": []any{
+				map[string]any{"delivery_reference": delayedLiveRef},
+			},
+		})))
+		if rErr != nil {
+			lockErrCh <- rErr
+			return
+		}
+		item := fixtureObject(t, rOut)["results"].([]any)[0].(map[string]any)
+		if item["status"] != "resolved" {
+			lockErrCh <- errors.New("expected resolved status during concurrent writer commit")
+			return
+		}
+		postCommitResolveHeader = string(canonical(item["header"]))
+	}()
+	go func() {
+		defer lockWg.Done()
+		if _, gErr := s.Get(ctx, fixtureKey, ""); gErr != nil {
+			lockErrCh <- gErr
+		}
+	}()
+	lockWg.Wait()
+	require.NoError(t, <-writerDone)
+	close(lockErrCh)
+	for lErr := range lockErrCh {
+		require.NoError(t, lErr)
+	}
+	require.Equal(t, preHeaderJSON, postCommitResolveHeader, "HeaderV1 must remain byte-identical after delayed trigger row persistence")
+
+	// (c) Positive after delayed trigger persistence: bind_live_ingress now reports trigger_row_persisted=true, content_attested_by_server=true.
+	postBindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_live_ingress",
+		"request_id":              "mysql-delayed-post-bind",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              delayedMsgID,
+		"message_seq":             delayedSeq,
+		"from_uid":                "peer",
+		"observed_payload_sha256": delayedDigest,
+	})))
+	require.NoError(t, err)
+	postBinding := fixtureObject(t, postBindOut)["binding"].(map[string]any)
+	require.Equal(t, "bound", postBinding["status"])
+	require.Equal(t, true, postBinding["trigger_row_persisted"])
+	require.Equal(t, true, postBinding["content_attested_by_server"])
+
+	// (d) Negative after delayed trigger persistence: if the persisted trigger row is revoked or deleted mid-turn,
+	// subsequent resolve(admit) and resolve(reply) on the live l1-... reference fail closed immediately.
+	_, err = sess.Exec("INSERT INTO message_extra(message_id,version,`revoke`,is_deleted,content_edit,content_edit_hash) VALUES(?,1,1,0,NULL,'')", delayedMsgID)
+	require.NoError(t, err)
+	for idx, purpose := range []string{"admit", "reply"} {
+		revLiveOut, rErr := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+			"schema_version":  json.Number("1"),
+			"profile_version": json.Number("1"),
+			"request_id":      strings.Repeat("c", 31) + strconv.Itoa(idx),
+			"operation":       "resolve",
+			"purpose":         purpose,
+			"references": []any{
+				map[string]any{"delivery_reference": delayedLiveRef},
+			},
+		})))
+		require.NoError(t, rErr)
+		revItem := fixtureObject(t, revLiveOut)["results"].([]any)[0].(map[string]any)
+		require.Equal(t, "unavailable", revItem["status"])
+		require.Equal(t, "expired_reference", revItem["reason"])
+	}
+
+	// (e) Verify SQL authority lineage committed_position == acknowledged_position (no double-Begin position drift).
+	var committedPos, ackedPos, checkpointPos int64
+	err = sess.QueryRow(
+		"SELECT committed_position, acknowledged_position, recoverable_scope_checkpoint FROM " + NativeAuthorityLineageTable + " WHERE singleton=1",
+	).Scan(&committedPos, &ackedPos, &checkpointPos)
+	require.NoError(t, err)
+	require.Equal(t, committedPos, ackedPos, "committed_position and acknowledged_position must match exactly")
+	require.Equal(t, committedPos, checkpointPos, "recoverable_scope_checkpoint must match committed_position")
 }
 
 func TestServerMessageFactsAsyncIngressSeparationWithoutTriggerRow(t *testing.T) {
@@ -2392,5 +2546,148 @@ func TestServerMessageFactsNativeSingleWriterLineageConcurrentLiveIngress(t *tes
 	for err := range errCh {
 		require.NoError(t, err)
 	}
+
+	// Verify exact single-step SQL authority position allocation and acknowledgement:
+	var committedPos, ackedPos, checkpointPos int64
+	err = f.s.Session.QueryRow(
+		"SELECT committed_position, acknowledged_position, recoverable_scope_checkpoint FROM " + NativeAuthorityLineageTable + " WHERE singleton=1",
+	).Scan(&committedPos, &ackedPos, &checkpointPos)
+	require.NoError(t, err)
+	require.Equal(t, committedPos, ackedPos, "every BindDeliveredMessage and Facts call must acknowledge its exact committed position")
+	require.Equal(t, committedPos, checkpointPos)
+}
+
+func TestXIN2793SingleStepAuthorityPositionAndCancellationResilience(t *testing.T) {
+	ctx := t.Context()
+	f := newServerFacts(t)
+	f.exec("DELETE FROM bot_permission_scope")
+	f.exec(NativeAuthorityLineageDDL)
+	f.exec(ServerDisclosurePermitDDL)
+	f.p.durablePermits = true
+
+	statePath := filepath.Join(t.TempDir(), "authority-state.json")
+	driver, err := NewNativeSingleWriterLineageDriver(NativeSingleWriterLineageConfig{
+		Session:       f.s.Session,
+		Origin:        fixtureKey.Origin,
+		AuthorityID:   "sql-primary",
+		Incarnation:   strings.Repeat("a", 32),
+		CatalogDigest: fixturePin.Digest,
+		StatePath:     statePath,
+		Key:           []byte(strings.Repeat("m", 32)),
+		Provision:     true,
+		testNoLocks:   true,
+	})
+	require.NoError(t, err)
+	nativeAuthority, err := NewFencedAuthorityAdapter(ctx, driver, fixturePin.Digest)
+	require.NoError(t, err)
+	f.s.Authority = nativeAuthority
+
+	tx, err := f.s.Session.Begin()
+	require.NoError(t, err)
+	defer tx.RollbackUnlessCommitted()
+	anchor, err := f.s.Native.Scope(ctx, tx, fixtureKey, "owner", strings.Repeat("a", 32))
+	require.NoError(t, err)
+	require.NoError(t, f.s.ProvisionSuffix(ctx, tx, fixtureKey, anchor, fixturePin))
+	require.NoError(t, tx.Commit())
+
+	adapter, err := NewSQLNativeFactAdapter(nativeAuthority, f.p)
+	require.NoError(t, err)
+	adapter.testNoLocks = true
+	c := &config.Context{}
+	require.NoError(t, Install(c, f.s, fixturePin, adapter))
+	rt := RuntimeFor(c)
+	require.NotNil(t, rt)
+
+	readLineagePositions := func() (uint64, uint64) {
+		var committed, acked int64
+		qErr := f.s.Session.QueryRow(
+			"SELECT committed_position, acknowledged_position FROM " + NativeAuthorityLineageTable + " WHERE singleton=1",
+		).Scan(&committed, &acked)
+		require.NoError(t, qErr)
+		require.Equal(t, committed, acked)
+		return uint64(committed), uint64(acked)
+	}
+	extractReportedSQLPosition := func(raw []byte) uint64 {
+		env := fixtureObject(t, raw)
+		for _, item := range env["authorities"].([]any) {
+			a := item.(map[string]any)
+			if a["kind"] == "sql" {
+				pos, pErr := strconv.ParseUint(a["position"].(string), 10, 64)
+				require.NoError(t, pErr)
+				return pos
+			}
+		}
+		t.Fatal("missing sql authority descriptor")
+		return 0
+	}
+
+	startCommitted, _ := readLineagePositions()
+	digest := sha256OfJSON(map[string]any{"type": 1, "content": "XIN2793-SINGLE-STEP-POS"})
+
+	// 1. BindDeliveredMessage (bind_live_ingress) advances SQL position by exactly 1, and reported position == acknowledged_position.
+	bindOut, err := rt.BindDeliveredMessage(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":          json.Number("1"),
+		"operation":               "bind_live_ingress",
+		"request_id":              "xin2793-pos-bind-1",
+		"channel_type":            json.Number("2"),
+		"channel_id":              "group",
+		"message_id":              "9900001",
+		"message_seq":             "50",
+		"from_uid":                "peer",
+		"observed_payload_sha256": digest,
+	})))
+	require.NoError(t, err)
+	reportedBindPos := extractReportedSQLPosition(bindOut)
+	afterBindCommitted, afterBindAcked := readLineagePositions()
+	require.Equal(t, startCommitted+1, reportedBindPos)
+	require.Equal(t, reportedBindPos, afterBindCommitted)
+	require.Equal(t, reportedBindPos, afterBindAcked)
+
+	delivRef := fixtureObject(t, bindOut)["binding"].(map[string]any)["delivery_reference"].(string)
+
+	// 2. Facts (resolve admit) advances SQL position by exactly 1, and reported position == acknowledged_position.
+	resOut, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("1", 32),
+		"operation":       "resolve",
+		"purpose":         "admit",
+		"references": []any{
+			map[string]any{"delivery_reference": delivRef},
+		},
+	})))
+	require.NoError(t, err)
+	reportedResPos := extractReportedSQLPosition(resOut)
+	afterResCommitted, afterResAcked := readLineagePositions()
+	require.Equal(t, afterBindCommitted+1, reportedResPos)
+	require.Equal(t, reportedResPos, afterResCommitted)
+	require.Equal(t, reportedResPos, afterResAcked)
+
+	// 3. Canceled caller context during AcquireCurrent/RecordAcknowledgedPosition does NOT brick the driver (d.failed stays false).
+	canceledCtx, cancelNow := context.WithCancel(ctx)
+	cancelNow()
+	txCanceled, err := f.s.Session.Begin()
+	require.NoError(t, err)
+	_, err = driver.AcquireCurrent(canceledCtx, txCanceled)
+	require.ErrorIs(t, err, ErrUnavailable)
+	_ = txCanceled.Rollback()
+
+	// Next healthy request succeeds and advances position cleanly by 1.
+	res2Out, err := rt.Facts(ctx, fixtureKey, bytes.NewReader(canonical(map[string]any{
+		"schema_version":  json.Number("1"),
+		"profile_version": json.Number("1"),
+		"request_id":      strings.Repeat("2", 32),
+		"operation":       "resolve",
+		"purpose":         "reply",
+		"references": []any{
+			map[string]any{"delivery_reference": delivRef},
+		},
+	})))
+	require.NoError(t, err)
+	reportedRes2Pos := extractReportedSQLPosition(res2Out)
+	afterRes2Committed, afterRes2Acked := readLineagePositions()
+	require.Equal(t, afterResCommitted+1, reportedRes2Pos)
+	require.Equal(t, reportedRes2Pos, afterRes2Committed)
+	require.Equal(t, reportedRes2Pos, afterRes2Acked)
 }
 

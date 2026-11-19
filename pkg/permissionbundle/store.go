@@ -155,7 +155,11 @@ func anchorBytes(a NativeAnchor) []byte { m, _ := asObject(a); return canonical(
 func (s Store) read(ctx context.Context, t *scopeTx, lock string) (header, error) {
 	q := `SELECT scope_incarnation,revision,context_epoch,schema_version,catalog_version,catalog_digest,bundle_json,bundle_digest,native_anchor_json,native_anchor_digest,retired,updated_by,updated_at FROM bot_permission_scope WHERE bot_uid=? AND space_id=?`
 	if lock != "" && !s.testNoLocks {
-		q += " FOR " + lock + " NOWAIT"
+		if lock == "SHARE" {
+			q += " FOR SHARE"
+		} else {
+			q += " FOR " + lock + " NOWAIT"
+		}
 	}
 	var nonce, catDigest, bundle, bd, anchor, ad []byte
 	var rev, epoch string

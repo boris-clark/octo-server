@@ -143,7 +143,10 @@ func validateEvaluateCurrentAccessRequest(m map[string]any) bool {
 			return false
 		}
 	}
-	if m["schema_version"] != json.Number("1") || m["profile_version"] != json.Number("1") || m["operation"] != "evaluate_current_access" {
+	if m["schema_version"] != json.Number("1") || m["operation"] != "evaluate_current_access" {
+		return false
+	}
+	if pv, hasPV := m["profile_version"]; hasPV && pv != json.Number("1") {
 		return false
 	}
 	reqID, ok := m["request_id"].(string)
@@ -162,8 +165,12 @@ func validateEvaluateCurrentAccessRequest(m map[string]any) bool {
 	if err != nil || (chTypeU64 != channelTypePerson && chTypeU64 != channelTypeGroup && chTypeU64 != channelTypeThread) {
 		return false
 	}
+	maxChLen := 256
 	chID, ok := m["channel_id"].(string)
-	if !ok || chID == "" || len(chID) > 256 {
+	if chTypeU64 == channelTypePerson && strings.Contains(chID, "@") {
+		maxChLen = 400
+	}
+	if !ok || chID == "" || len(chID) > maxChLen {
 		return false
 	}
 	callerUID, ok := m["caller_uid"].(string)
@@ -478,7 +485,8 @@ func (r *Runtime) Facts(ctx context.Context, key Key, body io.Reader) ([]byte, e
 	if e != nil {
 		return nil, e
 	}
-	response, e := r.facts.Read(ctx, t.tx, key, input)
+	readCtx := withActiveAuthorityRead(ctx, t.tx, t.authority)
+	response, e := r.facts.Read(readCtx, t.tx, key, input)
 	if e != nil {
 		return nil, ErrUnavailable
 	}
@@ -520,6 +528,7 @@ func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte,
 	}
 	allowed := map[string]bool{
 		"schema_version":          true,
+		"profile_version":         true,
 		"operation":               true,
 		"request_id":              true,
 		"channel_type":            true,
@@ -539,6 +548,9 @@ func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte,
 	if m["schema_version"] != json.Number("1") || (op != "bind_delivery" && op != "bind_live_ingress") {
 		return DeliveryBindingRequestV1{}, nil, ErrInvalid
 	}
+	if pv, hasPV := m["profile_version"]; hasPV && pv != json.Number("1") {
+		return DeliveryBindingRequestV1{}, nil, ErrInvalid
+	}
 	reqID, ok := m["request_id"].(string)
 	if !ok || !ValidNativeID(reqID) {
 		return DeliveryBindingRequestV1{}, nil, ErrInvalid
@@ -551,8 +563,12 @@ func parseDeliveryBindingRequest(r io.Reader) (DeliveryBindingRequestV1, []byte,
 	if err != nil || (chTypeU64 != channelTypePerson && chTypeU64 != channelTypeGroup && chTypeU64 != channelTypeThread) {
 		return DeliveryBindingRequestV1{}, nil, ErrInvalid
 	}
+	maxChLen := 256
 	chID, ok := m["channel_id"].(string)
-	if !ok || chID == "" || len(chID) > 256 {
+	if chTypeU64 == channelTypePerson && strings.Contains(chID, "@") {
+		maxChLen = 400
+	}
+	if !ok || chID == "" || len(chID) > maxChLen {
 		return DeliveryBindingRequestV1{}, nil, ErrInvalid
 	}
 	msgID, ok := m["message_id"].(string)
@@ -780,7 +796,8 @@ func (r *Runtime) BindDeliveredMessage(ctx context.Context, key Key, body io.Rea
 	if e != nil {
 		return nil, e
 	}
-	response, e := binder.BindDeliveredMessage(ctx, t.tx, key, input)
+	bindCtx := withActiveAuthorityRead(ctx, t.tx, t.authority)
+	response, e := binder.BindDeliveredMessage(bindCtx, t.tx, key, input)
 	if e != nil {
 		if errors.Is(e, ErrInvalid) {
 			return nil, ErrInvalid

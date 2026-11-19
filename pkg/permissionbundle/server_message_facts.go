@@ -313,7 +313,7 @@ func (p *ServerMessageFactProvider) cut(started time.Time) (IMAuthorityCut, erro
 
 func (p *ServerMessageFactProvider) lockSuffix(ctx context.Context) string {
 	if tc, ok := factReadTxFromContext(ctx); ok && !tc.testNoLocks {
-		return " FOR SHARE NOWAIT"
+		return " FOR SHARE"
 	}
 	return ""
 }
